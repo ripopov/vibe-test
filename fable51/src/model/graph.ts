@@ -1,6 +1,9 @@
-import type { Dir, Expr, Loc } from '../parser/ast';
+import type { Dir, Expr, Loc, ProcBlock } from '../parser/ast';
 import { collectIds, exprToString } from '../parser/parser';
-import { evalConst, rangeWidth, resolveConnections, type Design, type ModuleInfo } from './design';
+import {
+  childParams, elaborateItems, evalConst, paramSummary, portsOf, rangeWidth, resolveConnections,
+  type Design, type ElabItems, type ModuleInfo, type Scope,
+} from './design';
 
 export type Side = 'W' | 'E';
 export type PinDir = 'in' | 'out' | 'inout' | 'unknown';
@@ -19,6 +22,10 @@ export interface SPin {
   sliceLabel?: string;
   /** input of a gate symbol that is inverted (drawn as a bubble) */
   inverted?: boolean;
+  /** edge-sensitive input of a process (drawn with a clock triangle) */
+  clock?: 'posedge' | 'negedge';
+  /** width shown on the wire when it is not just the bit count (memories: "256×32") */
+  widthLabel?: string;
   netKey?: string;
   tooltip?: string;
   x: number;
@@ -27,7 +34,7 @@ export interface SPin {
   loc?: Loc;
 }
 
-export type NodeKind = 'inst' | 'port' | 'expr' | 'join' | 'split' | 'const';
+export type NodeKind = 'inst' | 'port' | 'expr' | 'join' | 'split' | 'const' | 'proc';
 
 export interface SNode {
   id: string;
@@ -40,7 +47,7 @@ export interface SNode {
   x: number;
   y: number;
   loc?: Loc;
-  refKind: 'instance' | 'port' | 'assign' | 'connection';
+  refKind: 'instance' | 'port' | 'assign' | 'connection' | 'process';
   refName: string;
   instPath?: string;
   moduleName?: string;
@@ -84,6 +91,11 @@ export interface NetInfo {
   declared: boolean;
   /** number of resolved sink endpoints (after aliasing) */
   fanout: number;
+  /** unpacked array: number of elements and packed width of one element */
+  elems?: number;
+  packed?: number;
+  /** element index of an unpacked array element net (`mem[3]`) */
+  elemOf?: { array: string; index: number };
 }
 
 export interface Endpoint {
@@ -153,6 +165,9 @@ class GraphBuilder {
   private nets = new Map<string, NetInfo>();
   private constNodes = new Map<string, SNode>();
   private mi: ModuleInfo;
+  private items: ElabItems;
+  private scope: Scope;
+  private declaredNames = new Set<string>();
 
   constructor(
     private design: Design,
@@ -160,10 +175,13 @@ class GraphBuilder {
     private opts: GraphOptions,
     private ids: { n: number; e: number },
     private path: string,
+    params?: Map<string, number>,
   ) {
     const mi = design.modules.get(moduleName);
     if (!mi) throw new Error(`unknown module ${moduleName}`);
     this.mi = mi;
+    this.scope = { params: params ?? mi.params, rename: null };
+    this.items = elaborateItems(mi.ast, this.scope.params);
   }
 
   private newId(): string {
@@ -174,7 +192,12 @@ class GraphBuilder {
   }
 
   private params(): Map<string, number> {
-    return this.mi.params;
+    return this.scope.params;
+  }
+
+  /** Apply generate-scope renames to a local net name. */
+  private netName(name: string): string {
+    return this.scope.rename?.get(name) ?? name;
   }
 
   private getNet(name: string, loc?: Loc): NetInfo {
@@ -189,9 +212,24 @@ class GraphBuilder {
     return n;
   }
 
+  /** Net for element `index` of unpacked array `arr` (created on first use). */
+  private getElem(arr: NetInfo, index: number, loc?: Loc): NetInfo {
+    const name = `${arr.name}[${index}]`;
+    let n = this.nets.get(name);
+    if (!n) {
+      n = this.getNet(name, loc ?? arr.loc);
+      n.msb = arr.msb;
+      n.lsb = arr.lsb;
+      n.width = arr.packed ?? arr.width;
+      n.declared = true;
+      n.elemOf = { array: arr.name, index };
+      // element nets are drawn with the array's declaration; the whole array keeps its flattened range
+    }
+    return n;
+  }
+
   private declareNets() {
-    const params = this.params();
-    for (const p of this.mi.ports) {
+    for (const p of portsOf(this.mi, this.params())) {
       const n = this.getNet(p.name, p.decl.loc);
       n.msb = p.msb;
       n.lsb = p.lsb;
@@ -199,9 +237,12 @@ class GraphBuilder {
       n.isPort = p.dir;
       n.declared = true;
       n.loc = p.decl.loc;
+      this.declaredNames.add(p.name);
     }
-    for (const d of this.mi.ast.nets) {
-      const n = this.getNet(d.name, d.loc);
+    for (const { decl: d, name, scope } of this.items.nets) {
+      const params = scope.params;
+      const n = this.getNet(name, d.loc);
+      this.declaredNames.add(name);
       if (d.range) {
         const msb = evalConst(d.range.msb, params);
         const lsb = evalConst(d.range.lsb, params);
@@ -211,9 +252,50 @@ class GraphBuilder {
           n.width = rangeWidth(msb, lsb);
         }
       }
+      if (d.unpacked.length) {
+        let elems = 1;
+        for (const r of d.unpacked) {
+          const a = evalConst(r.msb, params);
+          const b = evalConst(r.lsb, params);
+          elems *= a !== null && b !== null ? rangeWidth(a, b) : 1;
+        }
+        n.elems = elems;
+        n.packed = n.width;
+        n.width = elems * n.packed;
+      }
       n.declared = true;
       if (!n.isPort) n.loc = d.loc;
     }
+  }
+
+  /** A parameter / genvar name (unless a net of the same name is declared). */
+  private isParamName(name: string): boolean {
+    return this.params().has(name) && !this.declaredNames.has(this.netName(name)) && !this.nets.has(this.netName(name));
+  }
+
+  /** Whole-array pins show "elems×width" instead of the flattened bit count. */
+  private widthLabelFor(net: NetInfo, hi: number, lo: number): string | undefined {
+    if (net.elems && net.packed && hi - lo + 1 === net.width) return `${net.elems}×${net.packed}`;
+    return undefined;
+  }
+
+  /**
+   * Net designated by an expression base: a plain identifier, or `array[const]` for an unpacked
+   * array element. Returns null for anything else (dynamic index, nested expression).
+   */
+  private baseNet(e: Expr): { net: NetInfo; loc: Loc } | null {
+    if (e.kind === 'id') {
+      if (this.isParamName(e.name)) return null;
+      return { net: this.getNet(this.netName(e.name), e.loc), loc: e.loc };
+    }
+    if (e.kind === 'select' && e.base.kind === 'id') {
+      const arr = this.getNet(this.netName(e.base.name), e.base.loc);
+      if (!arr.elems) return null;
+      const i = evalConst(e.index, this.params());
+      if (i === null) return null;
+      return { net: this.getElem(arr, i, e.loc), loc: e.loc };
+    }
+    return null;
   }
 
   // ---- helpers -----------------------------------------------------------
@@ -221,17 +303,23 @@ class GraphBuilder {
   /** Try to interpret an expression as a plain net reference (with optional constant slice). */
   private plainRef(e: Expr): PlainRef | null {
     const params = this.params();
-    if (e.kind === 'id') {
-      const n = this.getNet(e.name, e.loc);
-      return { net: e.name, hi: Math.max(n.msb, n.lsb), lo: Math.min(n.msb, n.lsb), partial: false, text: e.name, loc: e.loc };
+    const whole = this.baseNet(e);
+    if (whole) {
+      const n = whole.net;
+      const hi = n.elems ? n.width - 1 : Math.max(n.msb, n.lsb);
+      const lo = n.elems ? 0 : Math.min(n.msb, n.lsb);
+      return { net: n.name, hi, lo, partial: false, text: exprToString(e), loc: e.loc };
     }
-    if (e.kind === 'select' && e.base.kind === 'id') {
+    if (e.kind === 'select') {
+      const base = this.baseNet(e.base);
+      if (!base || base.net.elems) return null;
       const i = evalConst(e.index, params);
       if (i === null) return null;
-      this.getNet(e.base.name, e.base.loc);
-      return { net: e.base.name, hi: i, lo: i, partial: true, text: exprToString(e), loc: e.loc };
+      return { net: base.net.name, hi: i, lo: i, partial: true, text: exprToString(e), loc: e.loc };
     }
-    if (e.kind === 'range' && e.base.kind === 'id') {
+    if (e.kind === 'range') {
+      const base = this.baseNet(e.base);
+      if (!base || base.net.elems) return null;
       const a = evalConst(e.msb, params);
       const b = evalConst(e.lsb, params);
       if (a === null || b === null) return null;
@@ -246,11 +334,67 @@ class GraphBuilder {
         hi = a;
         lo = a - b + 1;
       }
-      const n = this.getNet(e.base.name, e.base.loc);
+      const n = base.net;
       const full = hi === Math.max(n.msb, n.lsb) && lo === Math.min(n.msb, n.lsb);
-      return { net: e.base.name, hi, lo, partial: !full, text: exprToString(e), loc: e.loc };
+      return { net: n.name, hi, lo, partial: !full, text: exprToString(e), loc: e.loc };
     }
     return null;
+  }
+
+  /** The net an arbitrary lvalue/rvalue expression touches, widened to the whole net when the selection is dynamic. */
+  private wholeRef(e: Expr): PlainRef | null {
+    const r = this.plainRef(e);
+    if (r) return r;
+    if (e.kind === 'select' || e.kind === 'range') {
+      const b = this.baseNet(e.base) ?? (e.base.kind === 'select' || e.base.kind === 'range' ? null : null);
+      if (b) {
+        const n = b.net;
+        const hi = n.elems ? n.width - 1 : Math.max(n.msb, n.lsb);
+        const lo = n.elems ? 0 : Math.min(n.msb, n.lsb);
+        return { net: n.name, hi, lo, partial: false, text: exprToString(e), loc: e.loc };
+      }
+      return this.wholeRef(e.base);
+    }
+    return null;
+  }
+
+  /** Visit every net reference inside an expression (dynamic indices are visited as reads too). */
+  private visitRefs(e: Expr, cb: (ref: PlainRef, expr: Expr) => void) {
+    const r = this.plainRef(e);
+    if (r) {
+      cb(r, e);
+      return;
+    }
+    switch (e.kind) {
+      case 'select':
+        this.visitRefs(e.base, cb);
+        if (!this.isConst(e.index)) this.visitRefs(e.index, cb);
+        break;
+      case 'range':
+        this.visitRefs(e.base, cb);
+        if (!this.isConst(e.msb)) this.visitRefs(e.msb, cb);
+        if (!this.isConst(e.lsb)) this.visitRefs(e.lsb, cb);
+        break;
+      case 'concat':
+      case 'repl':
+        e.items.forEach((i) => this.visitRefs(i, cb));
+        break;
+      case 'unary':
+        this.visitRefs(e.arg, cb);
+        break;
+      case 'binary':
+        this.visitRefs(e.lhs, cb);
+        this.visitRefs(e.rhs, cb);
+        break;
+      case 'ternary':
+        this.visitRefs(e.cond, cb);
+        this.visitRefs(e.a, cb);
+        this.visitRefs(e.b, cb);
+        break;
+      case 'call':
+        e.args.forEach((i) => this.visitRefs(i, cb));
+        break;
+    }
   }
 
   private isConst(e: Expr): boolean {
@@ -258,7 +402,7 @@ class GraphBuilder {
     if (e.kind === 'concat' || e.kind === 'repl') return e.items.every((i) => this.isConst(i)) && (e.kind !== 'repl' || true);
     if (e.kind === 'unary') return this.isConst(e.arg);
     if (e.kind === 'binary') return this.isConst(e.lhs) && this.isConst(e.rhs);
-    if (e.kind === 'id') return this.params().has(e.name) && !this.nets.has(e.name) && !this.mi.ast.nets.some((n) => n.name === e.name);
+    if (e.kind === 'id') return this.isParamName(e.name);
     return false;
   }
 
@@ -270,11 +414,18 @@ class GraphBuilder {
       case 'str':
         return Math.max(1, (e.text.length - 2) * 8);
       case 'id': {
-        if (params.has(e.name) && !this.nets.has(e.name)) return 32;
-        return this.getNet(e.name).width;
+        if (this.isParamName(e.name)) return 32;
+        return this.getNet(this.netName(e.name)).width;
       }
-      case 'select':
-        return 1;
+      case 'select': {
+        const b = this.baseNet(e.base);
+        if (b?.net.elems) return b.net.packed ?? 1;
+        const r = this.plainRef(e);
+        if (r) return 1;
+        const w = this.wholeRef(e);
+        const n = w ? this.nets.get(w.net) : undefined;
+        return n?.elemOf || n?.elems ? (n.packed ?? n.width) : 1;
+      }
       case 'range': {
         const r = this.plainRef(e);
         return r && r.hi !== null && r.lo !== null ? r.hi - r.lo + 1 : 1;
@@ -336,6 +487,7 @@ class GraphBuilder {
       pin.tooltip = ref.text;
       pin.connected = true;
       if (ref.partial && !pin.name.startsWith('[')) pin.sliceLabel = sliceText(ref);
+      pin.widthLabel = this.widthLabelFor(net, ref.hi, ref.lo);
       this.addEndpoint(net, { node, pin, hi: ref.hi, lo: ref.lo }, role);
       return;
     }
@@ -396,48 +548,22 @@ class GraphBuilder {
     const refs: Expr[] = [];
     const seen = new Set<string>();
     const invertedRefs = new Set<string>();
-    const visit = (e: Expr) => {
-      const r = this.plainRef(e);
-      if (r) {
-        if (!seen.has(r.text)) {
-          seen.add(r.text);
-          refs.push(e);
-        }
-        return;
+    if (node.symbol) {
+      const mark = (e: Expr) => {
+        if (e.kind === 'unary' && (e.op === '~' || e.op === '!') && this.plainRef(e.arg)) invertedRefs.add(this.plainRef(e.arg)!.text);
+        else if (e.kind === 'binary') {
+          mark(e.lhs);
+          mark(e.rhs);
+        } else if (e.kind === 'unary') mark(e.arg);
+      };
+      mark(expr);
+    }
+    this.visitRefs(expr, (r, e) => {
+      if (!seen.has(r.text)) {
+        seen.add(r.text);
+        refs.push(e);
       }
-      if (node.symbol && e.kind === 'unary' && (e.op === '~' || e.op === '!') && this.plainRef(e.arg)) {
-        invertedRefs.add(this.plainRef(e.arg)!.text);
-      }
-      switch (e.kind) {
-        case 'select':
-          visit(e.base);
-          if (!this.isConst(e.index)) visit(e.index);
-          break;
-        case 'range':
-          visit(e.base);
-          break;
-        case 'concat':
-        case 'repl':
-          e.items.forEach(visit);
-          break;
-        case 'unary':
-          visit(e.arg);
-          break;
-        case 'binary':
-          visit(e.lhs);
-          visit(e.rhs);
-          break;
-        case 'ternary':
-          visit(e.cond);
-          visit(e.a);
-          visit(e.b);
-          break;
-        case 'call':
-          e.args.forEach(visit);
-          break;
-      }
-    };
-    visit(expr);
+    });
     for (const r of refs) {
       const pr = this.plainRef(r)!;
       const p = this.makePin(node, pr.partial ? sliceText(pr) : '', 'W', 'in', this.exprWidth(r), r.loc);
@@ -465,7 +591,7 @@ class GraphBuilder {
     to.netKey = to.netKey ?? key;
     this.edges.push({
       id: this.newEdgeId(), from: from.id, to: to.id, width, nets: [key], netKey: key, tooltip,
-      tailLabel: width > 1 ? String(width) : undefined,
+      tailLabel: from.widthLabel ?? (width > 1 ? String(width) : undefined),
     });
     void fromNode;
     void toNode;
@@ -475,7 +601,7 @@ class GraphBuilder {
   // ---- module contents ---------------------------------------------------
 
   private buildPorts() {
-    for (const p of this.mi.ports) {
+    for (const p of portsOf(this.mi, this.params())) {
       const node = this.makeNode('port', p.name, 'port', p.name, p.decl.loc);
       node.portDir = p.dir;
       node.tooltip = `${p.dir} ${p.width > 1 ? `[${p.msb}:${p.lsb}] ` : ''}${p.name}`;
@@ -494,38 +620,42 @@ class GraphBuilder {
   }
 
   private buildInstances() {
-    for (const inst of this.mi.ast.instances) {
+    for (const { inst, name: instName, scope } of this.items.instances) {
+      this.scope = scope;
       const target = this.design.modules.get(inst.module);
+      const tParams = childParams(inst, this.params(), target);
+      const tPorts = target ? portsOf(target, tParams) : [];
       const conns = resolveConnections(inst, target, this.nets.keys());
       const rangeText = inst.range
         ? `[${evalConst(inst.range.msb, this.params()) ?? '?'}:${evalConst(inst.range.lsb, this.params()) ?? '?'}]`
         : '';
-      const node = this.makeNode('inst', inst.name + rangeText, 'instance', inst.name, inst.loc);
+      const node = this.makeNode('inst', instName + rangeText, 'instance', instName, inst.loc);
       node.subtitle = inst.module;
       node.moduleName = inst.module;
       node.isBlackBox = !target;
-      node.instPath = this.path ? `${this.path}/${inst.name}` : inst.name;
+      node.instPath = this.path ? `${this.path}/${instName}` : instName;
       node.symbol = target ? undefined : gateSymbol(inst.module);
       const relPath = node.instPath;
-      node.tooltip = `${inst.module} ${inst.name}${rangeText}${target ? '' : ' (black box)'}`;
+      const ptext = paramSummary(inst, this.params(), target);
+      node.tooltip = `${inst.module}${ptext ? ` #(${ptext})` : ''} ${instName}${rangeText}${target ? '' : ' (black box)'}`;
 
       const connByPort = new Map<string, { expr: Expr | null; loc: Loc }>();
       for (const c of conns) connByPort.set(c.port, { expr: c.expr, loc: inst.conns.find((x) => x.port === c.port)?.loc ?? inst.loc });
 
       const pinDefs: { name: string; dir: PinDir; width: number }[] = [];
       if (target) {
-        for (const p of target.ports) {
+        for (const p of tPorts) {
           if (!this.opts.showUnconnected && !connByPort.has(p.name)) continue;
           pinDefs.push({ name: p.name, dir: p.dir === 'input' ? 'in' : p.dir === 'output' ? 'out' : 'inout', width: p.width });
         }
         // connections to unknown ports (typos) are still shown
-        for (const c of conns) if (!target.ports.some((p) => p.name === c.port)) pinDefs.push({ name: c.port, dir: 'unknown', width: c.expr ? this.exprWidth(c.expr) : 1 });
+        for (const c of conns) if (!tPorts.some((p) => p.name === c.port)) pinDefs.push({ name: c.port, dir: 'unknown', width: c.expr ? this.exprWidth(c.expr) : 1 });
       } else {
         for (const c of conns) pinDefs.push({ name: c.port, dir: guessDir(c.port), width: c.expr ? this.exprWidth(c.expr) : 1 });
       }
 
       if (this.opts.expanded.has(relPath) && target && relPath.split('/').length < 12) {
-        this.buildExpanded(node, target, pinDefs, connByPort);
+        this.buildExpanded(node, target, tParams, pinDefs, connByPort);
         continue;
       }
 
@@ -538,9 +668,9 @@ class GraphBuilder {
     }
   }
 
-  private buildExpanded(node: SNode, target: ModuleInfo, pinDefs: { name: string; dir: PinDir; width: number }[], connByPort: Map<string, { expr: Expr | null; loc: Loc }>) {
+  private buildExpanded(node: SNode, target: ModuleInfo, tParams: Map<string, number>, pinDefs: { name: string; dir: PinDir; width: number }[], connByPort: Map<string, { expr: Expr | null; loc: Loc }>) {
     node.expanded = true;
-    const child = new GraphBuilder(this.design, target.name, this.opts, this.ids, node.instPath!).build();
+    const child = new GraphBuilder(this.design, target.name, this.opts, this.ids, node.instPath!, tParams).build();
     // Map child port nodes to pins of the compound node
     const pinByName = new Map<string, SPin>();
     for (const pd of pinDefs) {
@@ -573,7 +703,8 @@ class GraphBuilder {
   }
 
   private buildAssigns() {
-    for (const a of this.mi.ast.assigns) {
+    for (const { assign: a, scope } of this.items.assigns) {
+      this.scope = scope;
       const lhsItems = this.flattenLhs(a.lhs);
       if (!lhsItems) {
         // unusual lhs: make an expression node anyway
@@ -643,6 +774,113 @@ class GraphBuilder {
         const net = this.getNet(it.net, it.loc);
         this.addEndpoint(net, { node, pin: out, hi: it.hi, lo: it.lo }, 'out');
       }
+    }
+  }
+
+  /**
+   * Procedural blocks become process nodes: one input pin per net the block evaluates, one
+   * output pin per net it assigns. Edge-sensitive signals (clock, async reset) are marked.
+   */
+  private buildProcs() {
+    for (const { proc, scope } of this.items.procs) {
+      this.scope = scope;
+      const locals = new Set(proc.locals);
+      const sensText = proc.sens
+        ? proc.sens.map((s) => `${s.edge ? s.edge + ' ' : ''}${exprToString(s.expr)}`).join(', ')
+        : '';
+      const node = this.makeNode('proc', proc.kind, 'process', `${proc.kind}@${proc.loc.line}`, proc.loc);
+      node.subtitle = sensText ? `@(${sensText})` : proc.kind === 'always' ? '@*' : undefined;
+
+      type Span = { hi: number; lo: number; loc: Loc; partial: boolean };
+      const merge = (m: Map<string, Span>, r: PlainRef) => {
+        if (r.hi === null || r.lo === null) return;
+        const cur = m.get(r.net);
+        if (!cur) m.set(r.net, { hi: r.hi, lo: r.lo, loc: r.loc, partial: r.partial });
+        else {
+          cur.hi = Math.max(cur.hi, r.hi);
+          cur.lo = Math.min(cur.lo, r.lo);
+          cur.partial = cur.partial && r.partial;
+        }
+      };
+      const writes = new Map<string, Span>();
+      for (const w of proc.writes) {
+        for (const it of flattenConcat(w.lhs)) {
+          const r = this.wholeRef(it);
+          if (r) merge(writes, r);
+        }
+      }
+      const reads = new Map<string, Span>();
+      const edges = new Map<string, 'posedge' | 'negedge'>();
+      const order: string[] = [];
+      const noteRead = (r: PlainRef) => {
+        if (r.hi === null) return;
+        if (!reads.has(r.net)) order.push(r.net);
+        merge(reads, r);
+      };
+      if (proc.sens) {
+        for (const s of proc.sens) {
+          this.visitRefs(s.expr, (r) => {
+            noteRead(r);
+            if (s.edge) edges.set(r.net, s.edge);
+          });
+        }
+      }
+      for (const r of proc.reads) this.visitRefs(r, (ref) => noteRead(ref));
+
+      const isLocal = (name: string) => locals.has(name) || locals.has(name.replace(/\[.*$/, ''));
+      const full = (net: NetInfo, s: Span) => s.hi >= Math.max(net.msb, net.lsb) && s.lo <= Math.min(net.msb, net.lsb);
+      const dataIn = order.filter((n) => !edges.has(n) && !isLocal(n));
+      const clkIn = order.filter((n) => edges.has(n) && !isLocal(n));
+      const stateNets: string[] = [];
+      for (const name of [...dataIn, ...clkIn]) {
+        const span = reads.get(name)!;
+        const net = this.getNet(name, span.loc);
+        if (writes.has(name) && !edges.has(name)) {
+          stateNets.push(name);
+          continue;
+        }
+        const w = net.elems ? net.width : span.hi - span.lo + 1;
+        const pin = this.makePin(node, name, 'W', 'in', net.elems ? net.width : w, span.loc);
+        pin.clock = edges.get(name);
+        const isFull = net.elems ? true : full(net, span);
+        const hi = isFull ? Math.max(net.msb, net.lsb, net.width - 1) : span.hi;
+        const lo = isFull ? Math.min(net.msb, net.lsb) : span.lo;
+        if (!isFull) pin.sliceLabel = hi === lo ? `[${hi}]` : `[${hi}:${lo}]`;
+        pin.width = hi - lo + 1;
+        pin.widthLabel = this.widthLabelFor(net, hi, lo);
+        pin.tooltip = `${name}${pin.sliceLabel ?? ''}`;
+        this.addEndpoint(net, { node, pin, hi, lo }, 'in');
+      }
+      for (const [name, span] of writes) {
+        if (isLocal(name)) continue;
+        const net = this.getNet(name, span.loc);
+        const isFull = net.elems ? true : full(net, span);
+        const hi = isFull ? Math.max(net.msb, net.lsb, net.width - 1) : span.hi;
+        const lo = isFull ? Math.min(net.msb, net.lsb) : span.lo;
+        const pin = this.makePin(node, name, 'E', 'out', hi - lo + 1, span.loc);
+        if (!isFull) pin.sliceLabel = hi === lo ? `[${hi}]` : `[${hi}:${lo}]`;
+        pin.widthLabel = this.widthLabelFor(net, hi, lo);
+        pin.tooltip = `${name}${pin.sliceLabel ?? ''}`;
+        this.addEndpoint(net, { node, pin, hi, lo }, 'out');
+      }
+      const outs = [...writes.keys()].filter((n) => !isLocal(n));
+      node.refName = outs.length ? outs.join(', ') : node.refName;
+      node.tooltip = `${proc.kind}${sensText ? ` @(${sensText})` : ''} → ${outs.join(', ') || '(no outputs)'}${stateNets.length ? `\nreads its own ${stateNets.join(', ')}` : ''}`;
+    }
+  }
+
+  /** Connect unpacked-array element nets (`mem[3]`) with the whole-array net (`mem`) through aliases. */
+  private linkArrays() {
+    for (const net of [...this.nets.values()]) {
+      if (!net.elemOf) continue;
+      const arr = this.nets.get(net.elemOf.array);
+      if (!arr || !arr.packed) continue;
+      const base = net.elemOf.index * arr.packed;
+      const lo = Math.min(arr.msb, arr.lsb);
+      const hi = Math.max(arr.msb, arr.lsb);
+      const wholeDriven = arr.drivers.length > 0 || arr.unknowns.length > 0;
+      if (wholeDriven) net.aliases.push({ src: arr.name, srcHi: base + (hi - lo), srcLo: base, dstHi: hi, dstLo: lo, loc: arr.loc });
+      if (arr.sinks.length || arr.unknowns.length) arr.aliases.push({ src: net.name, srcHi: hi, srcLo: lo, dstHi: base + (hi - lo), dstLo: base, loc: net.loc });
     }
   }
 
@@ -766,14 +1004,18 @@ class GraphBuilder {
 
     const seen = new Set<string>();
     const labeledDrivers = new Set<string>();
+    const fullOf = (n: NetInfo) => (n.elems ? { hi: n.width - 1, lo: 0 } : { hi: Math.max(n.msb, n.lsb), lo: Math.min(n.msb, n.lsb) });
     for (const { net, sink, drivers } of sinkList) {
-      const sinkPartial = !(sink.hi === Math.max(net.msb, net.lsb) && sink.lo === Math.min(net.msb, net.lsb));
+      const nf = fullOf(net);
+      const sinkPartial = !(sink.hi === nf.hi && sink.lo === nf.lo);
+      const sinkEdges: { edge: SEdge; dstHi: number; dstLo: number }[] = [];
       for (const d of drivers) {
         const labeledNet = labelFor(d.chain, d.srcNet);
         const width = d.dstHi - d.dstLo + 1;
         const dstSlice = width === net.width && !sinkPartial ? '' : `[${d.dstHi}${d.dstHi !== d.dstLo ? ':' + d.dstLo : ''}]`;
         const srcNetW = d.srcNet.width;
-        const srcFull = d.srcHi === Math.max(d.srcNet.msb, d.srcNet.lsb) && d.srcLo === Math.min(d.srcNet.msb, d.srcNet.lsb);
+        const sf = fullOf(d.srcNet);
+        const srcFull = d.srcHi === sf.hi && d.srcLo === sf.lo;
         const srcSlice = srcFull ? '' : `[${d.srcHi}${d.srcHi !== d.srcLo ? ':' + d.srcLo : ''}]`;
         if (labeledNet) {
           // the flag shows the local (sink-side) net name; aliases are explained in the tooltip
@@ -803,21 +1045,48 @@ class GraphBuilder {
         if (srcSlice && !(dstSlice && d.srcNet === net) && !d.ep.pin.sliceLabel) headParts.push(srcSlice);
         if (dstSlice && !sink.pin.sliceLabel) headParts.push(dstSlice);
         const head = headParts.length === 2 ? `${headParts[0]}→${headParts[1]}` : headParts[0];
+        const netRange = net.elems ? ` ${net.elems}×${net.packed}` : net.width > 1 ? ` [${net.msb}:${net.lsb}]` : '';
         const tooltip = d.srcNet === net
-          ? `${net.name}${net.width > 1 ? ` [${net.msb}:${net.lsb}]` : ''}${dstSlice ? ' ' + dstSlice : ''}`
+          ? `${net.name}${netRange}${dstSlice ? ' ' + dstSlice : ''}`
           : `${net.name}${dstSlice} ← ${d.srcNet.name}${srcSlice}`;
-        this.edges.push({
+        const edge: SEdge = {
           id: this.newEdgeId(),
           from: d.ep.pin.id,
           to: sink.pin.id,
           width,
           nets,
           netKey: net.name,
-          tailLabel: d.ep.pin.width > 1 ? String(d.ep.pin.width) : undefined,
+          tailLabel: d.ep.pin.widthLabel ?? (d.ep.pin.width > 1 ? String(d.ep.pin.width) : undefined),
           headLabel: head || undefined,
           tooltip,
-        });
+        };
+        this.edges.push(edge);
+        sinkEdges.push({ edge, dstHi: d.dstHi, dstLo: d.dstLo });
         void srcNetW;
+      }
+      // several slices travelling between the same two pins are drawn as one wire
+      const groups = new Map<string, typeof sinkEdges>();
+      for (const se of sinkEdges) {
+        const k = `${se.edge.from}>${se.edge.to}`;
+        const g = groups.get(k);
+        if (g) g.push(se);
+        else groups.set(k, [se]);
+      }
+      for (const g of groups.values()) {
+        if (g.length < 2) continue;
+        g.sort((a, b) => b.dstHi - a.dstHi);
+        const first = g[0].edge;
+        let contiguous = true;
+        for (let i = 1; i < g.length; i++) if (g[i].dstHi !== g[i - 1].dstLo - 1) contiguous = false;
+        const hi = g[0].dstHi;
+        const lo = g[g.length - 1].dstLo;
+        const coversSink = contiguous && hi === sink.hi && lo === sink.lo;
+        first.width = g.reduce((a, x) => a + (x.dstHi - x.dstLo + 1), 0);
+        first.nets = Array.from(new Set(g.flatMap((x) => x.edge.nets)));
+        first.tooltip = g.map((x) => x.edge.tooltip).join('\n');
+        first.headLabel = coversSink && !sinkPartial ? undefined : contiguous ? `[${hi}:${lo}]` : `${g.length} slices`;
+        const drop = new Set(g.slice(1).map((x) => x.edge));
+        this.edges = this.edges.filter((e) => !drop.has(e));
       }
     }
     // remove const nodes that ended up unused
@@ -842,6 +1111,8 @@ class GraphBuilder {
     this.buildPorts();
     this.buildInstances();
     this.buildAssigns();
+    this.buildProcs();
+    this.linkArrays();
     this.resolveRoles();
     this.buildEdges();
     // tooltips for pins
@@ -932,9 +1203,9 @@ function exprSymbol(e: Expr): string | undefined {
   return undefined;
 }
 
-export function buildGraph(design: Design, moduleName: string, opts: Partial<GraphOptions> = {}, path = ''): SGraph {
+export function buildGraph(design: Design, moduleName: string, opts: Partial<GraphOptions> = {}, path = '', params?: Map<string, number>): SGraph {
   const o: GraphOptions = { ...defaultGraphOptions, ...opts };
-  return new GraphBuilder(design, moduleName, o, { n: 0, e: 0 }, path).build();
+  return new GraphBuilder(design, moduleName, o, { n: 0, e: 0 }, path, params).build();
 }
 
 /** Iterate over all nodes including expanded children */

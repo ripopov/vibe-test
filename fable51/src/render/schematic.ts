@@ -126,7 +126,7 @@ function renderNode(n: SNode, nodesG: SVGGElement, labelsG: SVGGElement, placed:
         renderSymbol(n, grp);
         break;
       }
-      grp.append(el('rect', { class: 'shape body', x: 0.5, y: 0.5, width: W - 1, height: H - 1, rx: 3 }));
+      grp.append(el('rect', { class: 'shape body', x: 0.5, y: 0.5, width: W - 1, height: H - 1, rx: n.kind === 'proc' ? 7 : 3 }));
       const hasSub = opts.showTypes && !!n.subtitle;
       if (n.expanded) {
         const headerH = M.headerTitle + (hasSub ? M.headerSub : 0) + 2;
@@ -144,6 +144,13 @@ function renderNode(n: SNode, nodesG: SVGGElement, labelsG: SVGGElement, placed:
         // clock triangle at the clk pin
         const clk = n.pins.find((p) => /clk|ck|clock/i.test(p.name) && p.side === 'W');
         if (clk) grp.append(el('path', { class: 'clkmark', d: `M0.5,${clk.y - 5} L8,${clk.y} L0.5,${clk.y + 5}` }));
+      }
+      // edge-sensitive inputs of a process (clock, async reset)
+      for (const p of n.pins) {
+        // async resets are edge-sensitive too but are not drawn as clocks
+        if (!p.clock || p.side !== 'W' || /rst|reset|clr|clear|set|preset|aload/i.test(p.name)) continue;
+        grp.append(el('path', { class: 'clkmark', d: `M0.5,${p.y - 5} L8,${p.y} L0.5,${p.y + 5}` }));
+        if (p.clock === 'negedge') grp.append(el('circle', { class: 'clkmark', cx: -3.5, cy: p.y, r: 2.5 }));
       }
       renderPins(n, grp, FONT.pin);
     }
@@ -267,6 +274,7 @@ export interface ThemeColors {
   nodeFill: string;
   nodeStroke: string;
   exprFill: string;
+  procFill: string;
   portFill: string;
   portStroke: string;
   wire: string;
@@ -282,12 +290,12 @@ export interface ThemeColors {
 }
 
 export const LIGHT: ThemeColors = {
-  bg: '#f7f7f5', fg: '#1f2328', muted: '#6b7280', nodeFill: '#ffffff', nodeStroke: '#3b4252', exprFill: '#fbfbfd',
+  bg: '#f7f7f5', fg: '#1f2328', muted: '#6b7280', nodeFill: '#ffffff', nodeStroke: '#3b4252', exprFill: '#fbfbfd', procFill: '#fdf8ee',
   portFill: '#e8f0fe', portStroke: '#3b6bd6', wire: '#2d3340', bus: '#1d4ed8', accent: '#f97316', accentSoft: '#fdba74',
   flagFill: '#fff7e6', flagStroke: '#c98a1b', constFill: '#eef2f7', constFg: '#475569', nc: '#9ca3af', selection: '#f97316',
 };
 export const DARK: ThemeColors = {
-  bg: '#14171c', fg: '#e5e7eb', muted: '#9aa3b2', nodeFill: '#1f242c', nodeStroke: '#c3cad6', exprFill: '#22282f',
+  bg: '#14171c', fg: '#e5e7eb', muted: '#9aa3b2', nodeFill: '#1f242c', nodeStroke: '#c3cad6', exprFill: '#22282f', procFill: '#2a2620',
   portFill: '#1e2c48', portStroke: '#7aa2f7', wire: '#d7dce4', bus: '#7aa2f7', accent: '#fb923c', accentSoft: '#f59e0b',
   flagFill: '#3a2f14', flagStroke: '#d9a441', constFill: '#2a3140', constFg: '#c3cad6', nc: '#6b7280', selection: '#fb923c',
 };
@@ -309,6 +317,7 @@ export function schematicCss(t: ThemeColors): string {
 .node .shape { fill: ${t.nodeFill}; stroke: ${t.nodeStroke}; stroke-width: 1.2; }
 .node .shape.open { fill: none; }
 .node.expr .shape { fill: ${t.exprFill}; }
+.node.proc .shape.body { fill: ${t.procFill}; }
 .node.const .shape { fill: ${t.constFill}; stroke: ${t.constFg}; stroke-width: 1; }
 .node.const .ctext { fill: ${t.constFg}; font-size: ${FONT.label}px; }
 .node.blackbox:not(.sym) .shape.body { stroke-dasharray: 5 3; }

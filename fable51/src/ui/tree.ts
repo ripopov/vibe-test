@@ -40,7 +40,7 @@ export class HierTree {
       row.append(name);
       const mod = document.createElement('span');
       mod.className = 'mod';
-      mod.textContent = n.module + (n.isBlackBox ? ' (black box)' : '');
+      mod.textContent = n.module + (n.paramText ? ` #(${n.paramText})` : '') + (n.isBlackBox ? ' (black box)' : '');
       row.append(mod);
       row.title = `${n.path}  :  ${n.module}`;
       tw.addEventListener('click', (ev) => {

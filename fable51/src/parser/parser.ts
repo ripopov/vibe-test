@@ -1,8 +1,18 @@
 import type {
-  Assign, Connection, Diagnostic, Dir, Expr, Instance, Loc, Module, NetDecl, ParamDecl,
-  ParamOverride, ParseResult, PortDecl, Range,
+  Assign, Connection, Diagnostic, Dir, Expr, GenBody, Instance, ItemBag, Loc, Module, NetDecl, ParamDecl,
+  ParamOverride, ParseResult, PortDecl, ProcBlock, Range, SensItem,
 } from './ast';
-import { tokenize, type Token } from './lexer';
+import { tokenize, type Token, type Macro } from './lexer';
+
+interface ProcCtx {
+  reads: Expr[];
+  writes: ProcBlock['writes'];
+  locals: string[];
+}
+
+export function newBag(): ItemBag {
+  return { nets: [], params: [], assigns: [], instances: [], procs: [], generates: [] };
+}
 
 const KEYWORDS = new Set([
   'module', 'macromodule', 'endmodule', 'input', 'output', 'inout', 'wire', 'reg', 'logic', 'tri',
@@ -46,9 +56,11 @@ export class Parser {
   private toks: Token[];
   private pos = 0;
   private diags: Diagnostic[] = [];
+  /** while parsing an assignment target, `<=` is the non-blocking operator, not a comparison */
+  private lhsMode = false;
 
-  constructor(private src: string) {
-    this.toks = tokenize(src);
+  constructor(private src: string, defines?: Map<string, Macro>) {
+    this.toks = tokenize(src, { defines, diagnostics: this.diags });
   }
 
   // ---- token helpers -------------------------------------------------------
@@ -210,6 +222,7 @@ export class Parser {
       if (t.kind !== 'op') break;
       const prec = BINARY_PREC[t.text];
       if (prec === undefined || prec < minPrec) break;
+      if (this.lhsMode && t.text === '<=') break;
       this.next();
       const rhs = this.parseBinary(prec + 1);
       lhs = { kind: 'binary', op: t.text, lhs, rhs, loc: this.loc(start) };
@@ -366,7 +379,7 @@ export class Parser {
     const kw = this.next(); // module
     const nameTok = this.expectId();
     const mod: Module = {
-      name: nameTok.text, ports: [], portOrder: [], nets: [], params: [], assigns: [], instances: [],
+      name: nameTok.text, ports: [], portOrder: [], ...newBag(),
       loc: this.loc(kw), headerLoc: this.loc(kw),
     };
     // package imports `import pkg::*;`
@@ -388,17 +401,7 @@ export class Parser {
     mod.headerLoc = this.loc(kw);
 
     while (this.peek().kind !== 'eof' && !this.at('endmodule')) {
-      const before = this.pos;
-      try {
-        this.parseItem(mod);
-      } catch (e) {
-        if (e instanceof ParseError) {
-          this.error(e.message, e.tok);
-          this.pos = Math.max(before, this.pos);
-          this.skipStatement();
-        } else throw e;
-      }
-      if (this.pos === before) this.next(); // guarantee progress
+      this.parseItemSafe(mod, mod);
     }
     const endTok = this.expect('endmodule');
     if (this.at(':') && this.peek(1).kind === 'id') {
@@ -521,7 +524,21 @@ export class Parser {
     }
   }
 
-  private parseItem(mod: Module) {
+  private parseItemSafe(bag: ItemBag, mod: Module) {
+    const before = this.pos;
+    try {
+      this.parseItem(bag, mod);
+    } catch (e) {
+      if (e instanceof ParseError) {
+        this.error(e.message, e.tok);
+        this.pos = Math.max(before, this.pos);
+        this.skipStatement();
+      } else throw e;
+    }
+    if (this.pos === before) this.next(); // guarantee progress
+  }
+
+  private parseItem(bag: ItemBag, mod: Module) {
     const t = this.peek();
     if (t.kind !== 'id') {
       if (t.kind === 'op' && t.text === ';') {
@@ -538,10 +555,10 @@ export class Parser {
         return;
       case 'parameter':
       case 'localparam':
-        this.parseParamDecl(mod);
+        this.parseParamDecl(bag);
         return;
       case 'assign':
-        this.parseAssign(mod);
+        this.parseAssign(bag);
         return;
       case 'defparam':
       case 'genvar':
@@ -571,44 +588,472 @@ export class Parser {
         this.skipBlock('specify', 'endspecify');
         return;
       case 'for':
+        this.parseGenFor(bag, mod);
+        return;
       case 'if':
+        this.parseGenIf(bag, mod);
+        return;
       case 'case':
-        // generate constructs: we cannot elaborate them, so skip.
+        // generate case: not elaborated
         this.error(`generate '${t.text}' block skipped (not elaborated)`, t, 'warning');
         this.skipGenerateConstruct();
         return;
-      case 'begin':
-        this.skipBlock('begin', 'end');
+      case 'begin': {
+        const body = this.parseGenBody(mod);
+        bag.generates.push({ kind: 'block', body, loc: this.loc(t) });
         return;
+      }
     }
     if (BLOCK_STARTERS.has(t.text)) {
-      this.next();
-      // always @(...) stmt / always_ff @(posedge clk) begin ... end
-      if (this.accept('@')) {
-        if (this.at('(')) this.skipParens();
-        else this.next(); // @*
-      }
-      this.skipStatement();
+      this.parseProc(bag);
       return;
     }
     if (NET_TYPES.has(t.text) || INT_TYPES.has(t.text)) {
-      this.parseNetDecl(mod);
+      this.parseNetDecl(bag);
       return;
     }
     if (!KEYWORDS.has(t.text)) {
       // instantiation: module_name [#(...)] inst_name [range] ( ... ) ;
       const n1 = this.peek(1);
       if ((n1.kind === 'op' && n1.text === '#') || (n1.kind === 'id' && !KEYWORDS.has(n1.text)) || (n1.kind === 'op' && n1.text === '(' )) {
-        this.parseInstantiation(mod);
+        this.parseInstantiation(bag);
         return;
       }
       // user-defined type declaration: mytype_t x;  -> treat as net of unknown width
       if (n1.kind === 'op' && n1.text === '[') {
-        this.parseNetDecl(mod);
+        this.parseNetDecl(bag);
         return;
       }
     }
     throw new ParseError(`unexpected '${t.text}'`, t);
+  }
+
+  // ---- generate blocks -----------------------------------------------------
+
+  private parseGenBody(mod: Module): GenBody {
+    const items = newBag();
+    let label: string | null = null;
+    if (this.at('begin')) {
+      this.next();
+      if (this.accept(':')) label = this.expectId().text;
+      while (!this.at('end') && !this.at('endmodule') && this.peek().kind !== 'eof') this.parseItemSafe(items, mod);
+      this.expect('end');
+      if (this.accept(':')) this.expectId();
+    } else {
+      this.parseItemSafe(items, mod);
+    }
+    return { label, items };
+  }
+
+  private parseGenFor(bag: ItemBag, mod: Module) {
+    const kw = this.next();
+    this.expect('(');
+    this.accept('genvar');
+    const varTok = this.expectId();
+    this.expect('=');
+    const init = this.parseExpr();
+    this.expect(';');
+    const cond = this.parseExpr();
+    this.expect(';');
+    const stepVar = this.expectId();
+    const v: Expr = { kind: 'id', name: stepVar.text, loc: this.loc(stepVar, stepVar) };
+    const one: Expr = { kind: 'num', text: '1', value: 1, width: null, loc: v.loc };
+    let step: Expr;
+    if (this.accept('++')) step = { kind: 'binary', op: '+', lhs: v, rhs: one, loc: v.loc };
+    else if (this.accept('--')) step = { kind: 'binary', op: '-', lhs: v, rhs: one, loc: v.loc };
+    else if (this.accept('+=')) step = { kind: 'binary', op: '+', lhs: v, rhs: this.parseExpr(), loc: v.loc };
+    else if (this.accept('-=')) step = { kind: 'binary', op: '-', lhs: v, rhs: this.parseExpr(), loc: v.loc };
+    else {
+      this.expect('=');
+      step = this.parseExpr();
+    }
+    this.expect(')');
+    const body = this.parseGenBody(mod);
+    bag.generates.push({ kind: 'for', genvar: varTok.text, init, cond, step, body, loc: this.loc(kw) });
+  }
+
+  private parseGenIf(bag: ItemBag, mod: Module) {
+    const kw = this.next();
+    this.expect('(');
+    const cond = this.parseExpr();
+    this.expect(')');
+    const then = this.parseGenBody(mod);
+    let els: GenBody | null = null;
+    if (this.accept('else')) {
+      if (this.at('if')) {
+        const inner = newBag();
+        this.parseGenIf(inner, mod);
+        els = { label: null, items: inner };
+      } else els = this.parseGenBody(mod);
+    }
+    bag.generates.push({ kind: 'if', cond, then, else: els, loc: this.loc(kw) });
+  }
+
+  // ---- procedural blocks ---------------------------------------------------
+
+  /** always / always_ff / always_comb / always_latch / initial / final */
+  private parseProc(bag: ItemBag) {
+    const kw = this.next();
+    const kind = kw.text === 'initial' || kw.text === 'final' ? null : (kw.text as ProcBlock['kind']);
+    let sens: SensItem[] | null = null;
+    if (this.at('#')) {
+      this.next();
+      if (this.at('(')) this.skipParens();
+      else this.next();
+    }
+    if (this.accept('@')) {
+      if (this.at('*')) this.next();
+      else if (this.at('(')) {
+        this.next();
+        if (this.at('*')) this.next();
+        else {
+          sens = [];
+          while (!this.at(')') && this.peek().kind !== 'eof') {
+            let edge: SensItem['edge'] = null;
+            if (this.at('posedge') || this.at('negedge')) edge = this.next().text as 'posedge' | 'negedge';
+            else if (this.at('edge')) this.next();
+            const expr = this.parseExpr();
+            sens.push({ edge, expr });
+            if (!this.accept(',') && !this.accept('or')) break;
+          }
+        }
+        this.expect(')');
+      } else if (this.peek().kind === 'id') {
+        const t = this.next();
+        sens = [{ edge: null, expr: { kind: 'id', name: t.text, loc: this.loc(t, t) } }];
+      }
+    }
+    const ctx: ProcCtx = { reads: [], writes: [], locals: [] };
+    this.parseStatement(ctx);
+    if (kind) bag.procs.push({ kind, sens, reads: ctx.reads, writes: ctx.writes, locals: ctx.locals, loc: this.loc(kw) });
+  }
+
+  /** Parse one statement, recovering at the next ';' on errors. */
+  private parseStatement(ctx: ProcCtx) {
+    const before = this.pos;
+    try {
+      this.parseStatementInner(ctx);
+    } catch (e) {
+      if (!(e instanceof ParseError)) throw e;
+      this.error(e.message, e.tok);
+      this.pos = Math.max(before, this.pos);
+      this.skipToStatementEnd();
+    }
+  }
+
+  /** Skip to just past the next ';' at nesting depth 0, stopping before a block closer. */
+  private skipToStatementEnd() {
+    let depth = 0;
+    const closers = new Set(['end', 'endcase', 'endmodule', 'join', 'join_any', 'join_none', 'endfunction', 'endtask', 'else']);
+    while (this.peek().kind !== 'eof') {
+      const t = this.peek();
+      if (depth === 0 && t.kind === 'op' && t.text === ';') {
+        this.next();
+        return;
+      }
+      if (depth === 0 && t.kind === 'id' && closers.has(t.text)) return;
+      if (t.kind === 'op' && (t.text === '(' || t.text === '[' || t.text === '{')) depth++;
+      if (t.kind === 'op' && (t.text === ')' || t.text === ']' || t.text === '}')) depth = Math.max(0, depth - 1);
+      this.next();
+    }
+  }
+
+  private skipTimingControl() {
+    if (this.at('#')) {
+      this.next();
+      if (this.at('(')) this.skipParens();
+      else this.next();
+    } else if (this.at('@')) {
+      this.next();
+      if (this.at('(')) this.skipParens();
+      else this.next();
+    }
+  }
+
+  private parseStatementInner(ctx: ProcCtx) {
+    const t = this.peek();
+    if (t.kind === 'op') {
+      if (t.text === ';') {
+        this.next();
+        return;
+      }
+      if (t.text === '#' || t.text === '@') {
+        this.skipTimingControl();
+        this.parseStatementInner(ctx);
+        return;
+      }
+      if (t.text === '{') {
+        this.parseProcAssign(ctx);
+        return;
+      }
+      if (t.text === '->') {
+        this.skipToStatementEnd();
+        return;
+      }
+      throw new ParseError(`unexpected '${t.text}' in statement`, t);
+    }
+    if (t.kind !== 'id') throw new ParseError(`unexpected '${this.describe(t)}' in statement`, t);
+    // labeled statement
+    if (!KEYWORDS.has(t.text) && this.at(':', 1)) {
+      this.next();
+      this.next();
+      this.parseStatementInner(ctx);
+      return;
+    }
+    switch (t.text) {
+      case 'begin':
+        this.parseStmtBlock(ctx, ['end']);
+        return;
+      case 'fork':
+        this.parseStmtBlock(ctx, ['join', 'join_any', 'join_none']);
+        return;
+      case 'unique':
+      case 'unique0':
+      case 'priority':
+        this.next();
+        this.parseStatementInner(ctx);
+        return;
+      case 'if': {
+        this.next();
+        this.expect('(');
+        ctx.reads.push(this.parseExpr());
+        this.expect(')');
+        this.parseStatement(ctx);
+        if (this.accept('else')) this.parseStatement(ctx);
+        return;
+      }
+      case 'case':
+      case 'casex':
+      case 'casez':
+        this.parseCase(ctx);
+        return;
+      case 'for':
+        this.parseFor(ctx);
+        return;
+      case 'while':
+      case 'repeat':
+      case 'wait': {
+        this.next();
+        this.expect('(');
+        ctx.reads.push(this.parseExpr());
+        this.expect(')');
+        this.parseStatement(ctx);
+        return;
+      }
+      case 'forever':
+        this.next();
+        this.parseStatement(ctx);
+        return;
+      case 'do': {
+        this.next();
+        this.parseStatement(ctx);
+        this.expect('while');
+        this.expect('(');
+        ctx.reads.push(this.parseExpr());
+        this.expect(')');
+        this.expect(';');
+        return;
+      }
+      case 'foreach':
+        this.next();
+        this.skipParens();
+        this.parseStatement(ctx);
+        return;
+      case 'disable':
+      case 'return':
+      case 'break':
+      case 'continue':
+      case 'assert':
+      case 'assume':
+      case 'cover':
+      case 'deassign':
+      case 'release':
+        this.skipToStatementEnd();
+        return;
+      case 'assign':
+      case 'force':
+        this.next();
+        this.parseProcAssign(ctx);
+        return;
+      case 'end':
+      case 'endcase':
+      case 'endmodule':
+      case 'join':
+      case 'else':
+        throw new ParseError(`unexpected '${t.text}'`, t);
+    }
+    // local declarations: integer i; logic [3:0] tmp = x;
+    if (NET_TYPES.has(t.text) || INT_TYPES.has(t.text) || t.text === 'real' || t.text === 'realtime' || t.text === 'genvar' || t.text === 'string' || t.text === 'automatic' || t.text === 'static') {
+      if (t.text === 'automatic' || t.text === 'static' || t.text === 'genvar') this.next();
+      const scratch = newBag();
+      this.parseNetDecl(scratch);
+      for (const nd of scratch.nets) ctx.locals.push(nd.name);
+      for (const a of scratch.assigns) ctx.reads.push(a.rhs);
+      return;
+    }
+    if (t.text.startsWith('$')) {
+      // system task ($display, $readmemh, ...): no dataflow
+      this.skipToStatementEnd();
+      return;
+    }
+    // user-defined type declaration `mytype_t x;`
+    if (this.peek(1).kind === 'id' && !KEYWORDS.has(this.peek(1).text)) {
+      const scratch = newBag();
+      this.next();
+      this.parseNetDecl(scratch);
+      for (const nd of scratch.nets) ctx.locals.push(nd.name);
+      return;
+    }
+    this.parseProcAssign(ctx);
+  }
+
+  private parseStmtBlock(ctx: ProcCtx, closers: string[]) {
+    this.next(); // begin / fork
+    if (this.accept(':')) this.expectId();
+    while (!closers.some((c) => this.at(c)) && !this.at('endmodule') && this.peek().kind !== 'eof') {
+      const before = this.pos;
+      this.parseStatement(ctx);
+      if (this.pos === before) this.next();
+    }
+    if (closers.some((c) => this.at(c))) {
+      this.next();
+      if (this.at(':') && this.peek(1).kind === 'id') {
+        this.next();
+        this.next();
+      }
+    }
+  }
+
+  private parseCase(ctx: ProcCtx) {
+    this.next();
+    this.expect('(');
+    ctx.reads.push(this.parseExpr());
+    this.expect(')');
+    this.accept('inside');
+    while (!this.at('endcase') && !this.at('endmodule') && this.peek().kind !== 'eof') {
+      const before = this.pos;
+      try {
+        if (this.at('default')) {
+          this.next();
+          this.accept(':');
+          this.parseStatement(ctx);
+        } else {
+          do {
+            if (this.at('[')) {
+              // value range [a:b] (case inside)
+              this.next();
+              ctx.reads.push(this.parseExpr());
+              this.expect(':');
+              ctx.reads.push(this.parseExpr());
+              this.expect(']');
+            } else ctx.reads.push(this.parseExpr());
+          } while (this.accept(','));
+          this.expect(':');
+          this.parseStatement(ctx);
+        }
+      } catch (e) {
+        if (!(e instanceof ParseError)) throw e;
+        this.error(e.message, e.tok);
+        this.skipToStatementEnd();
+      }
+      if (this.pos === before) this.next();
+    }
+    this.expect('endcase');
+  }
+
+  private parseFor(ctx: ProcCtx) {
+    this.next();
+    this.expect('(');
+    if (!this.at(';')) {
+      // init: [type] var = expr {, var = expr}
+      if (this.peek().kind === 'id' && (INT_TYPES.has(this.peek().text) || NET_TYPES.has(this.peek().text) || (this.peek(1).kind === 'id' && !KEYWORDS.has(this.peek(1).text)))) {
+        this.next();
+        while (this.at('[')) this.parseRange();
+      }
+      do {
+        const v = this.expectId();
+        ctx.locals.push(v.text);
+        if (this.accept('=')) ctx.reads.push(this.parseExpr());
+      } while (this.accept(','));
+    }
+    this.expect(';');
+    if (!this.at(';')) ctx.reads.push(this.parseExpr());
+    this.expect(';');
+    if (!this.at(')')) {
+      do {
+        this.lhsMode = true;
+        let e: Expr;
+        try {
+          e = this.parseExpr();
+        } finally {
+          this.lhsMode = false;
+        }
+        if (this.at('++') || this.at('--')) this.next();
+        else if (this.peek().kind === 'op' && /^([-+*\/&|^%]|<<|>>)?=$/.test(this.peek().text)) {
+          this.next();
+          ctx.reads.push(this.parseExpr());
+        }
+        void e;
+      } while (this.accept(','));
+    }
+    this.expect(')');
+    this.parseStatement(ctx);
+  }
+
+  /** lhs = rhs; lhs <= rhs; lhs op= rhs; lhs++; task(args); */
+  private parseProcAssign(ctx: ProcCtx) {
+    const start = this.peek();
+    this.lhsMode = true;
+    let lhs: Expr;
+    try {
+      lhs = this.parseExpr();
+    } finally {
+      this.lhsMode = false;
+    }
+    if (lhs.kind === 'call') {
+      // task call: arguments may be read (and written, for output args - treated as reads)
+      for (const a of lhs.args) ctx.reads.push(a);
+      this.expect(';');
+      return;
+    }
+    const opTok = this.peek();
+    if (opTok.kind === 'op' && (opTok.text === '++' || opTok.text === '--')) {
+      this.next();
+      ctx.writes.push({ lhs, nonblocking: false, loc: this.loc(start) });
+      ctx.reads.push(lhs);
+      this.expect(';');
+      return;
+    }
+    if (opTok.kind === 'op' && /^(<=|=|[-+*\/&|^%]=|<<=|>>=|<<<=|>>>=)$/.test(opTok.text)) {
+      this.next();
+      this.skipTimingControl();
+      const rhs = this.parseExpr();
+      ctx.writes.push({ lhs, nonblocking: opTok.text === '<=', loc: this.loc(start) });
+      ctx.reads.push(rhs);
+      if (opTok.text !== '=' && opTok.text !== '<=') ctx.reads.push(lhs);
+      this.addIndexReads(lhs, ctx);
+      this.expect(';');
+      return;
+    }
+    throw new ParseError(`expected assignment but found '${this.describe(opTok)}'`, opTok);
+  }
+
+  /** Indices used on the left-hand side (mem[addr] <= x) are read by the block. */
+  private addIndexReads(lhs: Expr, ctx: ProcCtx) {
+    switch (lhs.kind) {
+      case 'select':
+        ctx.reads.push(lhs.index);
+        this.addIndexReads(lhs.base, ctx);
+        break;
+      case 'range':
+        ctx.reads.push(lhs.msb);
+        ctx.reads.push(lhs.lsb);
+        this.addIndexReads(lhs.base, ctx);
+        break;
+      case 'concat':
+        lhs.items.forEach((i) => this.addIndexReads(i, ctx));
+        break;
+    }
   }
 
   private skipGenerateConstruct() {
@@ -669,7 +1114,7 @@ export class Parser {
     this.expect(';');
   }
 
-  private parseParamDecl(mod: Module) {
+  private parseParamDecl(mod: ItemBag) {
     const kw = this.next();
     this.skipDataType();
     do {
@@ -682,7 +1127,7 @@ export class Parser {
     this.expect(';');
   }
 
-  private parseNetDecl(mod: Module) {
+  private parseNetDecl(mod: ItemBag) {
     const typeTok = this.next();
     let netType = typeTok.text;
     if (netType === 'var' && this.peek().kind === 'id' && NET_TYPES.has(this.peek().text)) netType = this.next().text;
@@ -725,7 +1170,7 @@ export class Parser {
     this.expect(';');
   }
 
-  private parseAssign(mod: Module) {
+  private parseAssign(mod: ItemBag) {
     this.next(); // assign
     // optional drive strength / delay
     if (this.at('(')) {
@@ -751,7 +1196,7 @@ export class Parser {
     this.expect(';');
   }
 
-  private parseInstantiation(mod: Module) {
+  private parseInstantiation(mod: ItemBag) {
     const modTok = this.expectId();
     const params: ParamOverride[] = [];
     if (this.accept('#')) {
@@ -887,8 +1332,8 @@ export function parseNumber(text: string): { value: number | null; width: number
   return { value: Number.isNaN(v) ? null : v, width: null };
 }
 
-export function parseVerilog(src: string): ParseResult {
-  return new Parser(src).parse();
+export function parseVerilog(src: string, defines?: Map<string, Macro>): ParseResult {
+  return new Parser(src, defines).parse();
 }
 
 /** Render an expression back to compact Verilog text (used for labels/tooltips). */

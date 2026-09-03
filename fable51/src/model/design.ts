@@ -1,5 +1,6 @@
-import type { Dir, Expr, Module, ParseResult, PortDecl, Range } from '../parser/ast';
+import type { Assign, Dir, Expr, Instance, ItemBag, Module, NetDecl, ParseResult, PortDecl, ProcBlock, Range } from '../parser/ast';
 import { parseVerilog } from '../parser/parser';
+import type { Macro } from '../parser/lexer';
 
 export interface PortInfo {
   name: string;
@@ -13,10 +14,26 @@ export interface PortInfo {
 export interface ModuleInfo {
   name: string;
   ast: Module;
+  /** ports sized with the default parameter values */
   ports: PortInfo[];
+  /** default parameter values */
   params: Map<string, number>;
   /** number of direct child instances that resolve to defined modules */
   isLeaf: boolean;
+}
+
+/** Parameter/genvar values (and generate-scope renames) in effect for an elaborated item. */
+export interface Scope {
+  params: Map<string, number>;
+  /** local name -> hierarchical name for nets declared inside labelled generate blocks */
+  rename: Map<string, string> | null;
+}
+
+export interface ElabItems {
+  nets: { decl: NetDecl; name: string; scope: Scope }[];
+  assigns: { assign: Assign; scope: Scope }[];
+  instances: { inst: Instance; name: string; scope: Scope }[];
+  procs: { proc: ProcBlock; scope: Scope }[];
 }
 
 export interface Design {
@@ -108,10 +125,12 @@ export function rangeWidth(msb: number, lsb: number): number {
   return Math.abs(msb - lsb) + 1;
 }
 
-function buildParams(m: Module): Map<string, number> {
+/** Evaluate a module's parameters; `overrides` replace the defaults of non-local parameters. */
+export function buildParams(m: Module, overrides?: Map<string, number>): Map<string, number> {
   const params = new Map<string, number>();
+  if (overrides) for (const p of m.params) if (!p.local && overrides.has(p.name)) params.set(p.name, overrides.get(p.name)!);
   // iterate a few times to resolve forward references
-  for (let iter = 0; iter < 3; iter++) {
+  for (let iter = 0; iter < 4; iter++) {
     for (const p of m.params) {
       if (params.has(p.name)) continue;
       const v = evalConst(p.value, params);
@@ -119,6 +138,107 @@ function buildParams(m: Module): Map<string, number> {
     }
   }
   return params;
+}
+
+/** Ports of a module sized for the given parameter values. */
+export function portsOf(mi: ModuleInfo, params: Map<string, number>): PortInfo[] {
+  if (params === mi.params) return mi.ports;
+  return mi.ast.ports.map((p) => {
+    const { msb, lsb } = evalRange(p.range, params);
+    return { name: p.name, dir: p.dir ?? 'inout', msb, lsb, width: rangeWidth(msb, lsb), decl: p };
+  });
+}
+
+/** Parameter overrides an instance applies to its target, evaluated in the parent's scope. */
+export function instanceOverrides(inst: Instance, parentParams: Map<string, number>, target: ModuleInfo | undefined): Map<string, number> {
+  const out = new Map<string, number>();
+  const formal = target ? target.ast.params.filter((p) => !p.local) : [];
+  let pos = 0;
+  for (const po of inst.params) {
+    const v = evalConst(po.value, parentParams);
+    const name = po.name ?? formal[pos++]?.name;
+    if (name && v !== null) out.set(name, v);
+  }
+  return out;
+}
+
+/** Parameters of the module instantiated by `inst`, given the parent's scope. */
+export function childParams(inst: Instance, parentParams: Map<string, number>, target: ModuleInfo | undefined): Map<string, number> {
+  if (!target) return new Map();
+  const ov = instanceOverrides(inst, parentParams, target);
+  if (!ov.size) return target.params;
+  const p = buildParams(target.ast, ov);
+  // identical to defaults? share the default map so callers can compare by identity
+  let same = p.size === target.params.size;
+  if (same) for (const [k, v] of p) if (target.params.get(k) !== v) same = false;
+  return same ? target.params : p;
+}
+
+/** Non-default parameter values of an instance, for display (`WIDTH=8, N=4`). */
+export function paramSummary(inst: Instance, parentParams: Map<string, number>, target: ModuleInfo | undefined): string {
+  const ov = instanceOverrides(inst, parentParams, target);
+  const parts: string[] = [];
+  const fmt = (v: number) => (Number.isInteger(v) && Math.abs(v) >= 4096 ? `0x${v.toString(16)}` : String(v));
+  for (const [k, v] of ov) if (!target || target.params.get(k) !== v) parts.push(`${k}=${fmt(v)}`);
+  return parts.join(', ');
+}
+
+/**
+ * Flatten a module body for one set of parameter values: unroll generate loops, resolve
+ * generate conditions and evaluate local parameters. Nets/instances declared inside labelled
+ * generate blocks get hierarchical names (`label[i].name`).
+ */
+export function elaborateItems(m: Module, params: Map<string, number>): ElabItems {
+  const out: ElabItems = { nets: [], assigns: [], instances: [], procs: [] };
+  const walk = (bag: ItemBag, scope: Scope, prefix: string, depth: number) => {
+    if (depth > 16) return;
+    if (bag.params.length && bag !== m) {
+      const p = new Map(scope.params);
+      for (let iter = 0; iter < 3; iter++) for (const d of bag.params) {
+        if (p.has(d.name) && iter > 0) continue;
+        const v = evalConst(d.value, p);
+        if (v !== null) p.set(d.name, v);
+      }
+      scope = { params: p, rename: scope.rename };
+    }
+    if (prefix && bag.nets.length) {
+      const rn = new Map(scope.rename ?? []);
+      for (const d of bag.nets) rn.set(d.name, `${prefix}.${d.name}`);
+      scope = { params: scope.params, rename: rn };
+    }
+    for (const d of bag.nets) out.nets.push({ decl: d, name: prefix ? `${prefix}.${d.name}` : d.name, scope });
+    for (const a of bag.assigns) out.assigns.push({ assign: a, scope });
+    for (const i of bag.instances) out.instances.push({ inst: i, name: prefix ? `${prefix}.${i.name}` : i.name, scope });
+    for (const pr of bag.procs) out.procs.push({ proc: pr, scope });
+    for (const g of bag.generates) {
+      const join = (label: string | null, idx?: number) => {
+        const seg = label ? (idx === undefined ? label : `${label}[${idx}]`) : idx === undefined ? '' : `genblk[${idx}]`;
+        return seg ? (prefix ? `${prefix}.${seg}` : seg) : prefix;
+      };
+      if (g.kind === 'for') {
+        const p = new Map(scope.params);
+        let v = evalConst(g.init, p);
+        if (v === null) continue;
+        for (let iter = 0; iter < 4096; iter++) {
+          p.set(g.genvar, v);
+          const c = evalConst(g.cond, p);
+          if (!c) break;
+          walk(g.body.items, { params: new Map(p), rename: scope.rename }, join(g.body.label, v), depth + 1);
+          const nv = evalConst(g.step, p);
+          if (nv === null || nv === v) break;
+          v = nv;
+        }
+      } else if (g.kind === 'if') {
+        const c = evalConst(g.cond, scope.params);
+        const body = c ? g.then : c === 0 ? g.else : null;
+        if (body) walk(body.items, scope, join(body.label), depth + 1);
+      } else {
+        walk(g.body.items, scope, join(g.body.label), depth + 1);
+      }
+    }
+  };
+  walk(m, { params, rename: null }, '', 0);
+  return out;
 }
 
 export function elaborate(parse: ParseResult): Design {
@@ -134,7 +254,7 @@ export function elaborate(parse: ParseResult): Design {
   const blackBoxes = new Set<string>();
   const instantiated = new Set<string>();
   for (const mi of modules.values()) {
-    for (const inst of mi.ast.instances) {
+    for (const { inst } of elaborateItems(mi.ast, mi.params).instances) {
       instantiated.add(inst.module);
       if (modules.has(inst.module)) mi.isLeaf = false;
       else blackBoxes.add(inst.module);
@@ -149,7 +269,7 @@ export function elaborate(parse: ParseResult): Design {
     if (!mi || seen.has(name)) return 1;
     seen.add(name);
     let s = 1;
-    for (const inst of mi.ast.instances) s += hierSize(inst.module, seen);
+    for (const { inst } of elaborateItems(mi.ast, mi.params).instances) s += hierSize(inst.module, seen);
     seen.delete(name);
     sizeCache.set(name, s);
     return s;
@@ -159,8 +279,35 @@ export function elaborate(parse: ParseResult): Design {
   return { modules, blackBoxes, tops, parse };
 }
 
-export function loadDesign(src: string): Design {
-  return elaborate(parseVerilog(src));
+export function loadDesign(src: string, defines?: Map<string, Macro>): Design {
+  return elaborate(parseVerilog(src, defines));
+}
+
+export interface PathStep {
+  /** instance name ('' for the top) */
+  inst: string;
+  module: string;
+  params: Map<string, number>;
+  ast?: Instance;
+}
+
+/** Resolve an instance path (top + instance names) to modules and parameter values; null if invalid. */
+export function resolvePath(design: Design, top: string, path: string[]): PathStep[] | null {
+  const mi0 = design.modules.get(top);
+  if (!mi0) return null;
+  const steps: PathStep[] = [{ inst: '', module: top, params: mi0.params }];
+  let cur = mi0;
+  for (const name of path) {
+    const items = elaborateItems(cur.ast, steps[steps.length - 1].params);
+    const found = items.instances.find((x) => x.name === name);
+    if (!found) return null;
+    const target = design.modules.get(found.inst.module);
+    if (!target) return null;
+    const params = childParams(found.inst, found.scope.params, target);
+    steps.push({ inst: name, module: target.name, params, ast: found.inst });
+    cur = target;
+  }
+  return steps;
 }
 
 /** Resolve the connections of an instance to (portName -> expr) pairs, handling positional and .* */
@@ -208,19 +355,25 @@ export interface HierNode {
   children: HierNode[];
   isBlackBox: boolean;
   loc?: { start: number; end: number; line: number };
+  /** non-default parameters, e.g. "WIDTH=8" */
+  paramText?: string;
 }
 
-export function buildHierarchy(design: Design, top: string, maxDepth = 64): HierNode {
-  const build = (module: string, name: string, path: string, depth: number, loc?: HierNode['loc']): HierNode => {
+export function buildHierarchy(design: Design, top: string, maxDepth = 64, maxNodes = 20000): HierNode {
+  let count = 0;
+  const build = (module: string, name: string, path: string, depth: number, params: Map<string, number>, loc?: HierNode['loc'], paramText?: string): HierNode => {
     const mi = design.modules.get(module);
-    const node: HierNode = { name, module, path, children: [], isBlackBox: !mi, loc };
-    if (mi && depth < maxDepth) {
-      for (const inst of mi.ast.instances) {
-        const label = inst.range ? `${inst.name}[]` : inst.name;
-        node.children.push(build(inst.module, label, `${path}/${inst.name}`, depth + 1, inst.loc));
+    const node: HierNode = { name, module, path, children: [], isBlackBox: !mi, loc, paramText: paramText || undefined };
+    count++;
+    if (mi && depth < maxDepth && count < maxNodes) {
+      for (const { inst, name: iname, scope } of elaborateItems(mi.ast, params).instances) {
+        const label = inst.range ? `${iname}[]` : iname;
+        const target = design.modules.get(inst.module);
+        node.children.push(build(inst.module, label, `${path}/${iname}`, depth + 1, childParams(inst, scope.params, target), inst.loc, paramSummary(inst, scope.params, target)));
       }
     }
     return node;
   };
-  return build(top, top, top, 0);
+  const mi0 = design.modules.get(top);
+  return build(top, top, top, 0, mi0?.params ?? new Map());
 }

@@ -14,7 +14,7 @@ const settle = async () => {
 };
 const check = (name, ok, extra = '') => console.log(`${ok ? 'PASS' : 'FAIL'} ${name} ${extra}`);
 
-await page.goto(`${base}?theme=light&path=u_core`, { waitUntil: 'networkidle0' });
+await page.goto(`${base}?example=riscv&theme=light&path=u_core`, { waitUntil: 'networkidle0' });
 await settle();
 
 // 1. click an instance -> selected + editor jumps to its source line
@@ -162,5 +162,52 @@ await settle();
 res = await page.evaluate(() => ({ status: document.querySelector('#status').textContent, bb: document.querySelectorAll('.node.blackbox').length }));
 check('black boxes render', res.bb === 2, JSON.stringify(res));
 await page.screenshot({ path: 'shots/blackbox.png' });
+
+// 11. default example: riscv-simple-sv single-cycle core, process nodes, parameters
+await page.goto(`${base}?theme=light`, { waitUntil: 'networkidle0' });
+await settle();
+res = await page.evaluate(() => ({
+  example: document.querySelector('#example-select').value,
+  status: document.querySelector('#status').textContent,
+  crumbs: document.querySelector('#crumbs')?.textContent ?? '',
+  diags: document.querySelector('#diag-count')?.textContent,
+}));
+check('default example is riscv-simple-sv', res.example === 'rvsimple-singlecycle' && res.status.startsWith('toplevel'), JSON.stringify(res));
+check('no parser diagnostics', /modules/.test(res.diags ?? ''), res.diags);
+// descend into the ALU: an always_comb process drives result
+await page.evaluate(() => window.nsv.navigateTo(['riscv_core', 'singlecycle_datapath', 'alu']));
+await settle();
+const proc = await page.evaluate(() => {
+  const n = document.querySelector('.node.proc');
+  const r = n.querySelector('.shape').getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, tip: n.dataset.tip, pins: [...n.querySelectorAll('.pinlabel')].map((e) => e.textContent) };
+});
+check('always_comb renders as a process node', proc.tip.startsWith('always_comb') && proc.pins.includes('operand_a') && proc.pins.includes('result'), JSON.stringify(proc.pins));
+await page.mouse.click(proc.x, proc.y);
+await new Promise((r) => setTimeout(r, 200));
+res = await page.evaluate(() => ({ selected: document.querySelector('.node.selected')?.dataset.kind, hiliteText: document.querySelector('.cm-lineHilite')?.textContent }));
+check('clicking a process jumps to the always block', res.selected === 'proc' && /always_comb/.test(res.hiliteText ?? ''), JSON.stringify(res));
+// parameterised instance: multiplexer #(CHANNELS=8) shows 256-bit in_bus
+await page.evaluate(() => window.nsv.navigateTo(['riscv_core', 'singlecycle_datapath', 'mux_reg_writeback', 'multiplexer']));
+await settle();
+res = await page.evaluate(() => ({
+  status: document.querySelector('#status').textContent,
+  labels: [...document.querySelectorAll('.wlabel')].map((e) => e.textContent),
+  tree: document.querySelector('.tree .row.current')?.textContent,
+}));
+check('parameter overrides size the ports', res.labels.includes('256') && res.labels.includes('3'), JSON.stringify(res.labels));
+check('tree shows parameter values', (res.tree ?? '').includes('CHANNELS=8'), res.tree);
+// pipeline registers: unpacked array elements are separate nets
+await page.evaluate(() => { document.querySelector('#example-select').value = 'rvsimple-pipeline'; document.querySelector('#example-select').dispatchEvent(new Event('change')); });
+await settle();
+await page.evaluate(() => window.nsv.navigateTo(['riscv_core', 'pipeline_datapath']));
+await settle();
+res = await page.evaluate(() => ({
+  procs: document.querySelectorAll('.node.proc').length,
+  pins: [...document.querySelectorAll('.node.proc .pinlabel')].map((e) => e.textContent).filter((t) => /^inst\[/.test(t)),
+  status: document.querySelector('#status').textContent,
+}));
+check('pipeline registers are processes over array elements', res.procs === 4 && res.pins.includes('inst[0]') && res.pins.includes('inst[1]'), JSON.stringify(res));
+await page.screenshot({ path: 'shots/pipeline.png' });
 
 await browser.close();

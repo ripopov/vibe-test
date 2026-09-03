@@ -102,14 +102,14 @@ function nodeToElk(n: SNode, o: LayoutOptions, wired: Set<string>): ElkNode {
   if (n.kind === 'port') {
     node.layoutOptions!['elk.layered.layering.layerConstraint'] = n.portDir === 'input' ? 'FIRST' : 'LAST';
   }
-  if (n.kind === 'inst' && !n.children) {
+  if ((n.kind === 'inst' || n.kind === 'proc') && !n.children) {
     // instance name (and type) sit above the box; ELK reserves the space
     const hdr = headerSize(n, o.showTypes);
     node.labels = [{ text: n.title, width: hdr.width, height: hdr.height }];
     node.layoutOptions!['elk.nodeLabels.placement'] = 'OUTSIDE V_TOP H_LEFT';
     node.layoutOptions!['elk.spacing.labelNode'] = '2';
   }
-  if (o.freePinOrder && !n.children && n.kind === 'inst' && (!n.symbol || n.symbol === 'dff')) {
+  if (o.freePinOrder && !n.children && (n.kind === 'inst' || n.kind === 'proc') && (!n.symbol || n.symbol === 'dff')) {
     // ELK may reorder pins along each side; pins are centered over the box height
     node.layoutOptions = {
       ...node.layoutOptions,

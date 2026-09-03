@@ -38,6 +38,14 @@ with `◐`.
 * Constants become tags on the pin, concatenations become bus rippers,
   expressions become operator boxes (with gate symbols for `& | ^ ~ ?:`), and
   `assign a = b` aliases are drawn as a single wire.
+* Procedural blocks (`always_ff`, `always_comb`, `always @*`) are drawn as
+  rounded *process* boxes with one input pin per signal the block reads and
+  one output pin per signal it assigns; edge-sensitive clocks get a clock
+  triangle. A register written by `always_ff` therefore looks like a flop
+  whose D inputs are the nets its next-state logic depends on.
+* Unpacked arrays (`logic [31:0] mem [0:255]`) are nets whose wires carry a
+  `256×32` width label; constant element selects (`pc[PL_ID]`) are separate
+  nets, and dynamic reads (`mem[addr]`) are expression boxes.
 * Standard-cell like module names (`NAND2_X1`, `INV_X1`, `DFFR_X1`, …) are
   drawn as gate symbols even when the cell definitions are missing (black boxes
   are otherwise dashed boxes with pin directions guessed from the netlist).
@@ -46,18 +54,44 @@ with `◐`.
 
 ## Parser
 
-Tolerant, hand-written recursive descent parser for the structural subset of
-Verilog-2005 / SystemVerilog: ANSI and non-ANSI ports, parameters (evaluated
-for widths), named / positional / `.*` connections, bit and part selects,
-concatenations and replication, constants, instance arrays, escaped
-identifiers, attributes and compiler directives. Behavioural blocks
-(`always`, `initial`, functions, generate) are skipped, so a module with only
-behavioural code shows up as a leaf with ports. Parse errors are reported in
-the editor panel and never stop rendering of the rest of the file.
+Tolerant, hand-written recursive descent parser for Verilog-2005 /
+SystemVerilog netlists and simple RTL:
+
+* ANSI and non-ANSI ports, `logic`/`wire`/`reg` with packed and unpacked
+  dimensions, parameters and localparams (evaluated for widths, including
+  `$clog2` and `**`), named / positional / `.*` connections, bit and part
+  selects (`[a:b]`, `+:`), concatenations, replication, constants, instance
+  arrays, escaped identifiers, attributes.
+* Preprocessor: `` `define`` (with arguments), `` `undef``, `` `ifdef`` /
+  `` `ifndef`` / `` `elsif`` / `` `else`` / `` `endif`` and macro expansion;
+  tokens from a macro keep the source location of the macro usage so editor
+  synchronisation still works. `` `include`` is ignored (single-file viewer).
+* Per-instance parameter overrides: `mux #(.WIDTH(8), .CHANNELS(4)) u (...)`
+  sizes the pins of `u` and, when you descend into it, the ports and generate
+  loops of the child are elaborated with those values. The hierarchy tree
+  shows non-default parameters.
+* `generate` `for` / `if` blocks are unrolled (genvars become constants,
+  labelled blocks prefix their nets with `label[i].`).
+* `always` / `always_ff` / `always_comb` / `always_latch` bodies are parsed
+  (if/else, case, for, begin/end, blocking and non-blocking assignments,
+  local variables) and reduced to their read and write sets. `initial`
+  blocks, functions and tasks are skipped.
+
+Parse errors are reported in the editor panel and never stop rendering of the
+rest of the file.
 
 ## Examples
 
-* **RISC-V SoC** – a small hierarchical RV32I core with memories and
+* **riscv-simple-sv** (default) – the single-cycle, multicycle and 5-stage
+  pipeline RV32I cores from
+  [tilk/riscv-simple-sv](https://github.com/tilk/riscv-simple-sv)
+  (BSD 3-Clause), each assembled into one file by
+  `node scripts/import-rvsimple.mjs <checkout>`
+  (`src/examples/rvsimple_*.sv`). They exercise the SystemVerilog side of the
+  parser: macros and `` `ifdef``, parameterised multiplexers with generate
+  loops, `always_ff` pipeline registers over unpacked arrays and a
+  behavioural register file.
+* **RISC-V SoC** – a small hierarchical RV32I netlist with memories and
   peripherals (`src/examples/riscv.v`).
 * **Gate-level netlist** – a flat, generated 1.5k-cell pipelined design
   (`src/examples/gates.v`, `npm run gen:gates -- 1500`).

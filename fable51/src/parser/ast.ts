@@ -44,9 +44,48 @@ export interface NetDecl {
   range: Range | null;
   netType: string; // wire, reg, logic, tri, supply0, supply1 ...
   loc: Loc;
-  /** dimensions for arrays (unpacked) - we mostly ignore these */
+  /** unpacked array dimensions, e.g. `logic [31:0] mem [0:255]` */
   unpacked: Range[];
 }
+
+export interface SensItem {
+  edge: 'posedge' | 'negedge' | null;
+  expr: Expr;
+}
+
+/** A procedural block (always / always_ff / always_comb / always_latch) reduced to its dataflow. */
+export interface ProcBlock {
+  kind: 'always' | 'always_ff' | 'always_comb' | 'always_latch';
+  /** null for `always_comb`, `@*` and `@(*)` */
+  sens: SensItem[] | null;
+  /** expressions evaluated by the block (right-hand sides, conditions, indices) */
+  reads: Expr[];
+  /** left-hand sides assigned by the block */
+  writes: { lhs: Expr; nonblocking: boolean; loc: Loc }[];
+  /** variables declared inside the block (loop counters, temporaries) - not nets */
+  locals: string[];
+  loc: Loc;
+}
+
+/** Items that can appear in a module body or inside a generate block. */
+export interface ItemBag {
+  nets: NetDecl[];
+  params: ParamDecl[];
+  assigns: Assign[];
+  instances: Instance[];
+  procs: ProcBlock[];
+  generates: GenBlock[];
+}
+
+export interface GenBody {
+  label: string | null;
+  items: ItemBag;
+}
+
+export type GenBlock =
+  | { kind: 'for'; genvar: string; init: Expr; cond: Expr; step: Expr; body: GenBody; loc: Loc }
+  | { kind: 'if'; cond: Expr; then: GenBody; else: GenBody | null; loc: Loc }
+  | { kind: 'block'; body: GenBody; loc: Loc };
 
 export interface ParamDecl {
   name: string;
@@ -83,15 +122,11 @@ export interface Instance {
   loc: Loc;
 }
 
-export interface Module {
+export interface Module extends ItemBag {
   name: string;
   ports: PortDecl[];
   /** order of names in the header port list (for positional connections) */
   portOrder: string[];
-  nets: NetDecl[];
-  params: ParamDecl[];
-  assigns: Assign[];
-  instances: Instance[];
   loc: Loc;
   /** location of the header (module keyword .. ;) */
   headerLoc: Loc;

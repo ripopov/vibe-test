@@ -130,7 +130,10 @@ export function sizeNode(n: SNode, opts: { showTypes: boolean }) {
         sizeSymbol(n, left, right);
         return;
       }
-      const label = truncate(n.title, 28);
+      // a long expression is named after the net it drives; the full text stays in the tooltip
+      const label = n.title.length > 28 && n.refKind === 'assign' && n.refName && n.refName !== n.title
+        ? truncate(`${n.refName} = …`, 28)
+        : truncate(n.title, 28);
       n.title = label;
       const tw = monoWidth(label, FONT.expr);
       const maxL = Math.max(0, ...left.map((p) => textWidth(p.name, FONT.label)));

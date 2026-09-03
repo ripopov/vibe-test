@@ -1,7 +1,10 @@
 import './style.css';
 import riscvSrc from './examples/riscv.v?raw';
 import gatesSrc from './examples/gates.v?raw';
-import { loadDesign, buildHierarchy, type Design, type HierNode } from './model/design';
+import rvSingle from './examples/rvsimple_singlecycle.sv?raw';
+import rvMulti from './examples/rvsimple_multicycle.sv?raw';
+import rvPipe from './examples/rvsimple_pipeline.sv?raw';
+import { loadDesign, buildHierarchy, resolvePath, type Design, type HierNode } from './model/design';
 import { buildGraph, allNodes, allEdges, type SGraph, type SNode } from './model/graph';
 import { sizeGraph } from './layout/metrics';
 import { layoutGraph, type Placed } from './layout/layout';
@@ -14,7 +17,14 @@ import type { Loc } from './parser/ast';
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
 
-const EXAMPLES: Record<string, string> = { riscv: riscvSrc, gates: gatesSrc };
+const EXAMPLES: Record<string, string> = {
+  'rvsimple-singlecycle': rvSingle,
+  'rvsimple-multicycle': rvMulti,
+  'rvsimple-pipeline': rvPipe,
+  riscv: riscvSrc,
+  gates: gatesSrc,
+};
+const DEFAULT_EXAMPLE = 'rvsimple-singlecycle';
 
 interface State {
   design: Design;
@@ -95,14 +105,14 @@ let editor: SourceEditor | null = null;
 
 // ---- helpers ---------------------------------------------------------------
 function moduleAtPath(design: Design, top: string, path: string[]): string | null {
-  let mod = top;
-  for (const inst of path) {
-    const mi = design.modules.get(mod);
-    const i = mi?.ast.instances.find((x) => x.name === inst);
-    if (!i || !design.modules.has(i.module)) return null;
-    mod = i.module;
-  }
-  return design.modules.has(mod) ? mod : null;
+  const steps = resolvePath(design, top, path);
+  return steps ? steps[steps.length - 1].module : null;
+}
+
+/** parameter values of the module currently shown (instances may override defaults) */
+function currentParams(): Map<string, number> | undefined {
+  const steps = resolvePath(state.design, state.top, state.path);
+  return steps ? steps[steps.length - 1].params : undefined;
 }
 
 function currentModule(): string | null {
@@ -128,7 +138,7 @@ async function relayout(keepView = false) {
     return;
   }
   const t0 = performance.now();
-  const graph = buildGraph(state.design, mod, { expanded: state.expanded, labelFanout: state.labelFanout });
+  const graph = buildGraph(state.design, mod, { expanded: state.expanded, labelFanout: state.labelFanout }, '', currentParams());
   sizeGraph(graph, { showTypes: state.showTypes });
   const nNodes = [...allNodes(graph)].length;
   const nEdges = [...allEdges(graph)].length;
@@ -361,7 +371,7 @@ function cursorMoved(offset: number) {
     }
   }
   for (const n of state.graph.nodes) {
-    if ((n.kind === 'expr' || n.kind === 'const') && inside(n.loc)) {
+    if ((n.kind === 'expr' || n.kind === 'const' || n.kind === 'proc') && inside(n.loc)) {
       selectNode(n, true);
       return;
     }
@@ -740,8 +750,8 @@ makeSplitter($('#split-left'), $('#tree-panel'), false);
 makeSplitter($('#split-right'), $('#editor-panel'), true);
 
 // ---- boot ------------------------------------------------------------------
-const initialExample = params.get('example') ?? 'riscv';
-exampleSelect.value = EXAMPLES[initialExample] ? initialExample : 'riscv';
+const initialExample = params.get('example') ?? DEFAULT_EXAMPLE;
+exampleSelect.value = EXAMPLES[initialExample] ? initialExample : DEFAULT_EXAMPLE;
 const initialSrc = EXAMPLES[exampleSelect.value];
 editor = new SourceEditor($('#editor'), initialSrc, state.dark);
 editor.onChange = (doc) => sourceChanged(doc);
