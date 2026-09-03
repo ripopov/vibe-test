@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Netlist Schematic Viewer</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%233b6bd6%27/%3E%3Cpath d=%27M6 10h8v12H6zM18 10h8v12h-8zM14 16h4%27 stroke=%27white%27 stroke-width=%272%27 fill=%27none%27/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand"><span class="logo">⌥</span> Netlist Schematic Viewer</div>
+        <label class="field">Example
+          <select id="example-select">
+            <option value="riscv">RISC-V SoC (hierarchical)</option>
+            <option value="gates">Gate-level netlist (flat, 1.5k cells)</option>
+          </select>
+        </label>
+        <label class="field">Top
+          <select id="top-select"></select>
+        </label>
+        <button id="open-btn" class="btn" title="Open Verilog file(s)">Open…</button>
+        <input id="file-input" type="file" accept=".v,.sv,.vh,.svh,.txt" multiple hidden />
+        <div class="spacer"></div>
+        <label class="check" title="Show module type names inside instances"><input type="checkbox" id="opt-types" checked /> types</label>
+        <label class="check" title="Let the layout reorder pins on each side of a box to reduce crossings"><input type="checkbox" id="opt-pins" checked /> optimize pins</label>
+        <label class="check" title="Label every wire with its net name"><input type="checkbox" id="opt-netnames" /> net names</label>
+        <label class="field" title="Nets with at least this many sinks are drawn as labels instead of wires">fanout≥
+          <input type="number" id="opt-fanout" min="2" max="64" value="6" style="width:3.2em" />
+        </label>
+        <button id="theme-btn" class="btn icon" title="Toggle light/dark theme">◐</button>
+        <button id="editor-btn" class="btn icon" title="Toggle source editor">☰</button>
+      </header>
+      <div class="main">
+        <aside id="tree-panel" class="panel">
+          <div class="panel-title">Hierarchy</div>
+          <div id="tree" class="tree"></div>
+        </aside>
+        <div class="splitter" id="split-left"></div>
+        <section id="viewer-panel">
+          <div class="toolbar">
+            <nav id="breadcrumbs" class="breadcrumbs"></nav>
+            <div class="spacer"></div>
+            <div class="search-wrap">
+              <input id="search" type="search" placeholder="Search instances, nets, ports… (/)" autocomplete="off" />
+              <div id="search-results" class="search-results" hidden></div>
+            </div>
+            <button id="fit-btn" class="btn icon" title="Fit to view (F)">⤢</button>
+            <button id="zoom-in" class="btn icon" title="Zoom in (+)">+</button>
+            <button id="zoom-out" class="btn icon" title="Zoom out (−)">−</button>
+            <button id="expand-btn" class="btn" title="Expand selected instance in place (E)">Expand</button>
+            <button id="collapse-btn" class="btn" title="Collapse all expanded instances">Collapse</button>
+            <button id="export-btn" class="btn" title="Export SVG">Export SVG</button>
+          </div>
+          <div id="viewer" class="viewer" tabindex="0">
+            <svg id="svg" class="schematic" xmlns="http://www.w3.org/2000/svg">
+              <g id="viewport"></g>
+            </svg>
+            <div id="tooltip" class="tooltip" hidden></div>
+            <div id="status" class="status"></div>
+            <div id="overlay" class="overlay" hidden></div>
+            <div id="ctxmenu" class="ctxmenu" hidden></div>
+            <div id="drop-hint" class="drop-hint" hidden>Drop Verilog files to load</div>
+          </div>
+        </section>
+        <div class="splitter" id="split-right"></div>
+        <aside id="editor-panel" class="panel">
+          <div class="panel-title">Verilog source <span id="diag-count" class="badge"></span></div>
+          <div id="editor" class="editor"></div>
+          <div id="diagnostics" class="diagnostics"></div>
+        </aside>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

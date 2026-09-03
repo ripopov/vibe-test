@@ -1,0 +1,12 @@
+import puppeteer from 'puppeteer-core';
+const url = process.argv[2] ?? 'http://localhost:4173/?editor=0';
+const browser = await puppeteer.launch({ executablePath: '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox'] });
+const page = await browser.newPage();
+page.on('console', (m) => console.log('[console]', m.type(), m.text(), m.location()?.url));
+page.on('pageerror', (e) => console.log('[pageerror]', e.message, e.stack));
+page.on('requestfailed', (r) => console.log('[reqfail]', r.url(), r.failure()?.errorText));
+page.on('response', (r) => { if (r.status() >= 400) console.log('[resp]', r.status(), r.url()); });
+await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+await new Promise((r) => setTimeout(r, 3000));
+console.log('status:', await page.evaluate(() => document.querySelector('#status')?.textContent));
+await browser.close();

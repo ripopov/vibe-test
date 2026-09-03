@@ -1,0 +1,88 @@
+import type { HierNode } from '../model/design';
+
+export interface TreeCallbacks {
+  onSelect(node: HierNode): void;
+  onOpen(node: HierNode): void;
+}
+
+export class HierTree {
+  private rows = new Map<string, HTMLElement>();
+  private expanded = new Set<string>();
+  private root: HierNode | null = null;
+
+  constructor(private container: HTMLElement, private cb: TreeCallbacks) {}
+
+  render(root: HierNode) {
+    this.root = root;
+    // expand the first two levels by default
+    if (this.expanded.size === 0) {
+      this.expanded.add(root.path);
+      for (const c of root.children) this.expanded.add(c.path);
+    }
+    this.container.replaceChildren(this.build([root]));
+  }
+
+  private build(nodes: HierNode[]): HTMLUListElement {
+    const ul = document.createElement('ul');
+    for (const n of nodes) {
+      const li = document.createElement('li');
+      const row = document.createElement('div');
+      row.className = 'row' + (n.isBlackBox ? ' bb' : '');
+      row.dataset.path = n.path;
+      const tw = document.createElement('span');
+      tw.className = 'tw';
+      const hasKids = n.children.length > 0;
+      tw.textContent = hasKids ? (this.expanded.has(n.path) ? '▾' : '▸') : '';
+      row.append(tw);
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = n.name;
+      row.append(name);
+      const mod = document.createElement('span');
+      mod.className = 'mod';
+      mod.textContent = n.module + (n.isBlackBox ? ' (black box)' : '');
+      row.append(mod);
+      row.title = `${n.path}  :  ${n.module}`;
+      tw.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (!hasKids) return;
+        if (this.expanded.has(n.path)) this.expanded.delete(n.path);
+        else this.expanded.add(n.path);
+        if (this.root) this.render(this.root);
+      });
+      row.addEventListener('click', () => this.cb.onSelect(n));
+      row.addEventListener('dblclick', () => {
+        if (hasKids) this.expanded.add(n.path);
+        this.cb.onOpen(n);
+      });
+      li.append(row);
+      this.rows.set(n.path, row);
+      if (hasKids && this.expanded.has(n.path)) li.append(this.build(n.children));
+      ul.append(li);
+    }
+    return ul;
+  }
+
+  /** Mark current view (module being displayed) and selected instance */
+  setState(currentPath: string, selectedPath: string | null) {
+    // make sure ancestors of the selection are expanded
+    if (selectedPath) {
+      const parts = selectedPath.split('/');
+      for (let i = 1; i < parts.length; i++) this.expanded.add(parts.slice(0, i).join('/'));
+    }
+    const cur = currentPath.split('/');
+    for (let i = 1; i <= cur.length; i++) this.expanded.add(cur.slice(0, i).join('/'));
+    if (this.root) this.render(this.root);
+    for (const [p, row] of this.rows) {
+      row.classList.toggle('current', p === currentPath);
+      row.classList.toggle('selected', p === selectedPath);
+    }
+    const sel = selectedPath ? this.rows.get(selectedPath) : this.rows.get(currentPath);
+    sel?.scrollIntoView({ block: 'nearest' });
+  }
+
+  reset() {
+    this.expanded.clear();
+    this.rows.clear();
+  }
+}

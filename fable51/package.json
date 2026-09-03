@@ -1,0 +1,33 @@
+{
+  "name": "verilog-schematic-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "gen:gates": "node scripts/gen-gates.mjs",
+    "shot": "node scripts/screenshot.mjs"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.0",
+    "@codemirror/commands": "^6.10.1",
+    "@codemirror/language": "^6.11.3",
+    "@codemirror/legacy-modes": "^6.5.2",
+    "@codemirror/search": "^6.5.11",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.6",
+    "@lezer/highlight": "^1.2.1",
+    "elkjs": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "puppeteer-core": "^24.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
+  }
+}
