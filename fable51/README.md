@@ -70,6 +70,11 @@ slices, net-label heuristics) → `layout/metrics.ts` (text measurement, node
 sizing) → `layout/layout.ts` (ELK graph, options, worker) →
 `render/schematic.ts` (SVG).
 
+Layout strategy scales with the graph: small modules use ELK's network-simplex
+node placement with high thoroughness, medium ones Brandes-Köpf, and flat
+netlists above 400 nodes the compact SIMPLE placer with flat hierarchy handling
+(a 1.5k-cell netlist lays out in about one second).
+
 `scripts/screenshot.mjs` renders a view with headless Chrome and reports
 wire/box crossings, label overlaps, wire/label overlaps, edge crossings,
 bends and total wire length; `scripts/interact.mjs` runs end-to-end

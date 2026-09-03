@@ -52,7 +52,7 @@ lines.push(');');
 let cellIdx = 0;
 let netIdx = 0;
 let prevStageOutputs = [];
-for (let i = 0; i < nIn; i++) prevStageOutputs.push({ name: `din[${i}]`, depth: 0 });
+for (let i = 0; i < nIn; i++) prevStageOutputs.push({ name: `din[${i}]`, depth: 0, uses: 0 });
 let lastComb = [];
 for (let s = 0; s < STAGES; s++) {
   lines.push(`  // ---- stage ${s}`);
@@ -61,28 +61,53 @@ for (let s = 0; s < STAGES; s++) {
     const c = pick(weighted);
     const out = `n${netIdx++}`;
     lines.push(`  wire ${out};`);
-    // inputs: previous stage outputs or shallow cells of this stage (limits logic depth)
+    // inputs: previous stage outputs or shallow cells of this stage (limits logic depth);
+    // prefer nets nobody consumed yet so that few cells end up with dangling outputs
     const shallow = comb.filter((x) => x.depth < MAX_DEPTH);
+    const recent = shallow.slice(Math.max(0, shallow.length - 60));
+    const unused = recent.filter((x) => x.uses === 0);
     const ins = c.ins.map(() => {
       const fromPrev = rnd() < 0.35 || shallow.length < 4;
-      return fromPrev ? pick(prevStageOutputs) : pick(shallow.slice(Math.max(0, shallow.length - 60)));
+      const src = fromPrev ? pick(prevStageOutputs) : unused.length && rnd() < 0.7 ? pick(unused) : pick(recent);
+      src.uses = (src.uses ?? 0) + 1;
+      return src;
     });
     const depth = Math.max(...ins.map((x) => x.depth)) + 1;
     const conns = c.ins.map((p, k) => `.${p}(${ins[k].name})`).join(', ');
     lines.push(`  ${c.name} U${cellIdx++} (${conns}, .${c.out}(${out}));`);
-    comb.push({ name: out, depth });
+    comb.push({ name: out, depth, uses: 0 });
   }
   // per-stage enable (high fan-out net -> drawn as labels)
   lines.push(`  wire en_${s};`);
   lines.push(`  AND2_X1 U${cellIdx++} (.A1(en), .A2(${pick(comb).name}), .Z(en_${s}));`);
   const q = [];
+  // flops capture the deepest unconsumed cones first
   const deep = comb.filter((x) => x.depth >= 3);
+  const dangling = comb.filter((x) => x.uses === 0).sort((a, b) => b.depth - a.depth);
   for (let i = 0; i < flopsPerStage; i++) {
-    const d = pick(deep.length ? deep : comb);
+    const d = dangling.length ? dangling.shift() : pick(deep.length ? deep : comb);
+    d.uses = (d.uses ?? 0) + 1;
     const name = `q${s}_${i}`;
     lines.push(`  wire ${name};`);
     if (rnd() < 0.25) lines.push(`  EDFFR_X1 U${cellIdx++} (.CK(clk), .RN(rst_n), .E(en_${s}), .D(${d.name}), .Q(${name}));`);
     else lines.push(`  DFFR_X1 U${cellIdx++} (.CK(clk), .RN(rst_n), .D(${d.name}), .Q(${name}));`);
+    q.push({ name, depth: 0 });
+  }
+  // whatever is still unused feeds a small XOR reduction into the next stage
+  const left = comb.filter((x) => x.uses === 0);
+  while (left.length > 1) {
+    const a = left.shift(), b = left.shift();
+    const out = `n${netIdx++}`;
+    lines.push(`  wire ${out};`);
+    lines.push(`  XOR2_X1 U${cellIdx++} (.A(${a.name}), .B(${b.name}), .Z(${out}));`);
+    a.uses = b.uses = 1;
+    left.push({ name: out, depth: Math.max(a.depth, b.depth) + 1, uses: 0 });
+  }
+  if (left.length) {
+    const name = `q${s}_x`;
+    lines.push(`  wire ${name};`);
+    lines.push(`  DFFR_X1 U${cellIdx++} (.CK(clk), .RN(rst_n), .D(${left[0].name}), .Q(${name}));`);
+    left[0].uses = 1;
     q.push({ name, depth: 0 });
   }
   prevStageOutputs = q;

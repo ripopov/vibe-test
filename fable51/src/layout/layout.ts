@@ -233,7 +233,9 @@ export function graphToElk(g: SGraph, o: LayoutOptions, root = true, outerPins =
       'elk.layered.layering.strategy': 'NETWORK_SIMPLEX',
       // network simplex placement gives the most compact, straight results but is slow (and
       // recursion-heavy) on big graphs
-      'elk.layered.nodePlacement.strategy': g.nodes.length <= 150 ? 'NETWORK_SIMPLEX' : 'BRANDES_KOEPF',
+      // ... and Brandes-Koepf turns thousands of long straight edges into thousands of lanes,
+      // so big flat netlists use the compact SIMPLE placer
+      'elk.layered.nodePlacement.strategy': g.nodes.length <= 150 ? 'NETWORK_SIMPLEX' : g.nodes.length <= 400 ? 'BRANDES_KOEPF' : 'SIMPLE',
       'elk.layered.nodePlacement.bk.fixedAlignment': 'BALANCED',
       'elk.layered.nodePlacement.bk.edgeStraightening': 'IMPROVE_STRAIGHTNESS',
       'elk.layered.nodePlacement.favorStraightEdges': 'true',
