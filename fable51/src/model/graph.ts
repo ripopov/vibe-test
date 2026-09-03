@@ -17,6 +17,8 @@ export interface SPin {
   constLabel?: string;
   /** bit/part-select of the connected net, e.g. "[7:0]" */
   sliceLabel?: string;
+  /** input of a gate symbol that is inverted (drawn as a bubble) */
+  inverted?: boolean;
   netKey?: string;
   tooltip?: string;
   x: number;
@@ -393,6 +395,7 @@ class GraphBuilder {
     // inputs: distinct plain refs in order of appearance
     const refs: Expr[] = [];
     const seen = new Set<string>();
+    const invertedRefs = new Set<string>();
     const visit = (e: Expr) => {
       const r = this.plainRef(e);
       if (r) {
@@ -401,6 +404,9 @@ class GraphBuilder {
           refs.push(e);
         }
         return;
+      }
+      if (node.symbol && e.kind === 'unary' && (e.op === '~' || e.op === '!') && this.plainRef(e.arg)) {
+        invertedRefs.add(this.plainRef(e.arg)!.text);
       }
       switch (e.kind) {
         case 'select':
@@ -435,6 +441,7 @@ class GraphBuilder {
     for (const r of refs) {
       const pr = this.plainRef(r)!;
       const p = this.makePin(node, pr.partial ? sliceText(pr) : '', 'W', 'in', this.exprWidth(r), r.loc);
+      if (invertedRefs.has(pr.text)) p.inverted = true;
       this.connectPin(node, p, r, 'in', r.loc);
     }
     if (node.symbol === 'mux') {
@@ -909,8 +916,10 @@ function isPlainRefExpr(e: Expr): boolean {
  */
 function exprSymbol(e: Expr): string | undefined {
   const gateOf: Record<string, string> = { '&': 'and', '&&': 'and', '|': 'or', '||': 'or', '^': 'xor', '~^': 'xnor', '^~': 'xnor' };
+  // leaves may be bare nets or inverted bare nets (drawn as input bubbles)
+  const leaf = (x: Expr): boolean => isPlainRefExpr(x) || ((x.kind === 'unary' && (x.op === '~' || x.op === '!')) && isPlainRefExpr(x.arg));
   const pureChain = (x: Expr, op: string): boolean =>
-    isPlainRefExpr(x) || (x.kind === 'binary' && x.op === op && pureChain(x.lhs, op) && pureChain(x.rhs, op));
+    leaf(x) || (x.kind === 'binary' && x.op === op && pureChain(x.lhs, op) && pureChain(x.rhs, op));
   if (e.kind === 'binary' && gateOf[e.op] && pureChain(e, e.op)) return gateOf[e.op];
   if (e.kind === 'unary' && (e.op === '~' || e.op === '!')) {
     if (isPlainRefExpr(e.arg)) return 'not';

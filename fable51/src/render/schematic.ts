@@ -218,7 +218,10 @@ function renderSymbol(n: SNode, grp: SVGGElement) {
   const left = n.pins.filter((p) => p.side === 'W');
   const right = n.pins.filter((p) => p.side === 'E');
   const stubL = sym === 'or' || sym === 'nor' || sym === 'xor' || sym === 'xnor' ? 12 : 8;
-  for (const p of left) grp.append(el('line', { class: 'stub', x1: 0, y1: p.y, x2: stubL + 1, y2: p.y }));
+  for (const p of left) {
+    grp.append(el('line', { class: 'stub', x1: 0, y1: p.y, x2: stubL + 1, y2: p.y }));
+    if (p.inverted) grp.append(el('circle', { class: 'shape bubble', cx: stubL - 3, cy: p.y, r: 3 }));
+  }
   for (const p of right) grp.append(el('line', { class: 'stub', x1: bodyR - 1, y1: p.y, x2: W, y2: p.y }));
   const x0 = 8;
   let d = '';
