@@ -10,8 +10,29 @@ npm install
 npm run dev        # http://localhost:5173
 npm run build      # static bundle in dist/
 npm test           # parser + layout unit tests
+npm run e2e        # desktop interaction checks (headless Chrome, dev server on :5173)
+npm run e2e:mobile # phone emulation checks (touch gestures, sheets, perf)
 npm run shot -- "http://localhost:4173/?editor=0&path=u_core" shots/core.png
 ```
+
+## Desktop and mobile
+
+Desktop browsers get the three-pane layout (hierarchy, schematic, source
+editor). Phones and small touch screens (`max-width: 820px`, or a coarse
+pointer below 1100px) get a schematic-first layout: the schematic fills the
+screen, the top bar holds the breadcrumbs plus search, hierarchy, source and
+settings buttons, and those panels open as bottom sheets. Tapping a node shows
+an info card with Descend / Expand / Zoom / Source actions; long-press opens the
+context menu; double-tap descends. `?mobile=1` or `?mobile=0` forces a mode.
+
+Touch input uses pointer events: one finger pans, two fingers pinch-zoom
+around the pinch centre, and the mode switches live when a window is resized
+across the breakpoint. Gestures are batched per animation frame; graphs with
+more than 5000 SVG elements pan and zoom through a composited CSS transform on
+the `<svg>` (no repaint per frame) that is committed to the real viewport
+transform when the gesture pauses or ends. Selection highlighting uses a
+per-render net index instead of scanning every element, and the hierarchy tree
+only rebuilds its DOM when a new branch has to be expanded.
 
 ## Layout
 
@@ -111,5 +132,7 @@ netlists above 400 nodes the compact SIMPLE placer with flat hierarchy handling
 
 `scripts/screenshot.mjs` renders a view with headless Chrome and reports
 wire/box crossings, label overlaps, wire/label overlaps, edge crossings,
-bends and total wire length; `scripts/interact.mjs` runs end-to-end
-interaction checks.
+bends and total wire length (`MOBILE=1` emulates a phone); `scripts/interact.mjs`
+runs desktop end-to-end interaction checks and `scripts/mobile.mjs` the
+phone-emulation checks (taps, double tap, pinch, long press, sheets, search,
+orientation change, gesture frame times under 4x CPU throttling).

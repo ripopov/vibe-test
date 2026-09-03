@@ -2,7 +2,9 @@
 <html lang="en" data-theme="light">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <title>Netlist Schematic Viewer</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%233b6bd6%27/%3E%3Cpath d=%27M6 10h8v12H6zM18 10h8v12h-8zM14 16h4%27 stroke=%27white%27 stroke-width=%272%27 fill=%27none%27/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -10,7 +12,16 @@
   </head>
   <body>
     <div id="app">
-      <header class="topbar">
+      <header id="mbar" class="mbar" hidden>
+        <button id="m-up" class="mbtn" title="Go up (parent module)">‹</button>
+        <div id="m-title" class="mtitle"></div>
+        <button id="m-search" class="mbtn" title="Search">⌕</button>
+        <button id="m-tree" class="mbtn" title="Hierarchy">▤</button>
+        <button id="m-source" class="mbtn" title="Verilog source">‹/›</button>
+        <button id="m-settings" class="mbtn" title="Settings">⚙</button>
+      </header>
+      <header class="topbar sheet" id="settings-panel">
+        <div class="panel-title mobile-only">Settings <span class="spacer"></span><button class="mclose" data-close="settings-panel" title="Close">×</button></div>
         <div class="brand"><span class="logo">⌥</span> Netlist Schematic Viewer</div>
         <label class="field">Example
           <select id="example-select">
@@ -37,8 +48,8 @@
         <button id="editor-btn" class="btn icon" title="Toggle source editor">☰</button>
       </header>
       <div class="main">
-        <aside id="tree-panel" class="panel">
-          <div class="panel-title">Hierarchy</div>
+        <aside id="tree-panel" class="panel sheet">
+          <div class="panel-title">Hierarchy <span class="spacer"></span><button class="mclose mobile-only" data-close="tree-panel" title="Close">×</button></div>
           <div id="tree" class="tree"></div>
         </aside>
         <div class="splitter" id="split-left"></div>
@@ -67,14 +78,25 @@
             <div id="ctxmenu" class="ctxmenu" hidden></div>
             <div id="drop-hint" class="drop-hint" hidden>Drop Verilog files to load</div>
           </div>
+          <div class="fabs mobile-only">
+            <button id="m-zoom-in" class="fab" title="Zoom in">+</button>
+            <button id="m-zoom-out" class="fab" title="Zoom out">−</button>
+            <button id="m-fit" class="fab" title="Fit to view">⤢</button>
+          </div>
+          <div id="infocard" class="infocard" hidden>
+            <div class="ic-head"><span id="ic-title"></span><span class="spacer"></span><button id="ic-close" class="mclose" title="Close">×</button></div>
+            <pre id="ic-tip" class="ic-tip"></pre>
+            <div id="ic-actions" class="ic-actions"></div>
+          </div>
         </section>
         <div class="splitter" id="split-right"></div>
-        <aside id="editor-panel" class="panel">
-          <div class="panel-title">Verilog source <span id="diag-count" class="badge"></span></div>
+        <aside id="editor-panel" class="panel sheet">
+          <div class="panel-title">Verilog source <span id="diag-count" class="badge"></span><span class="spacer"></span><button class="mclose mobile-only" data-close="editor-panel" title="Close">×</button></div>
           <div id="editor" class="editor"></div>
           <div id="diagnostics" class="diagnostics"></div>
         </aside>
       </div>
+      <div id="backdrop" class="backdrop" hidden></div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -1,10 +1,14 @@
 // Headless screenshot helper: node scripts/screenshot.mjs <url> <out.png> [width] [height]
-import puppeteer from 'puppeteer-core';
+import puppeteer, { KnownDevices } from 'puppeteer-core';
 
 const [url = 'http://localhost:4173/', out = 'shots/shot.png', w = '1600', h = '1000'] = process.argv.slice(2);
 const browser = await puppeteer.launch({ executablePath: '/usr/bin/google-chrome', headless: true, args: ['--no-sandbox', '--disable-gpu'] });
 const page = await browser.newPage();
-await page.setViewport({ width: parseInt(w, 10), height: parseInt(h, 10), deviceScaleFactor: 1 });
+// MOBILE=1 emulates a phone (touch, mobile UA, 390x844); MOBILE=<name> picks a puppeteer KnownDevice
+if (process.env.MOBILE) {
+  const dev = KnownDevices[process.env.MOBILE === '1' ? 'iPhone 13' : process.env.MOBILE];
+  await page.emulate({ ...dev, viewport: { ...dev.viewport, deviceScaleFactor: parseFloat(process.env.DPR ?? '2') } });
+} else await page.setViewport({ width: parseInt(w, 10), height: parseInt(h, 10), deviceScaleFactor: 1 });
 page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log('[console]', m.type(), m.text()); });
 page.on('pageerror', (e) => console.log('[pageerror]', e.message));
 await page.goto(url, { waitUntil: 'networkidle0', timeout: 120000 });

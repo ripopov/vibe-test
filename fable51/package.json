@@ -10,7 +10,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "gen:gates": "node scripts/gen-gates.mjs",
-    "shot": "node scripts/screenshot.mjs"
+    "shot": "node scripts/screenshot.mjs",
+    "e2e": "node scripts/interact.mjs http://localhost:5173/",
+    "e2e:mobile": "node scripts/mobile.mjs http://localhost:5173/"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.0",

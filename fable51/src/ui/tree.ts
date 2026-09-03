@@ -9,6 +9,10 @@ export class HierTree {
   private rows = new Map<string, HTMLElement>();
   private expanded = new Set<string>();
   private root: HierNode | null = null;
+  /** paths whose rows currently carry the current/selected classes */
+  private marked: string[] = [];
+  private curPath: string | null = null;
+  private selPath: string | null = null;
 
   constructor(private container: HTMLElement, private cb: TreeCallbacks) {}
 
@@ -19,7 +23,10 @@ export class HierTree {
       this.expanded.add(root.path);
       for (const c of root.children) this.expanded.add(c.path);
     }
+    this.rows.clear();
+    this.marked = [];
     this.container.replaceChildren(this.build([root]));
+    this.applyMarks();
   }
 
   private build(nodes: HierNode[]): HTMLUListElement {
@@ -65,24 +72,44 @@ export class HierTree {
 
   /** Mark current view (module being displayed) and selected instance */
   setState(currentPath: string, selectedPath: string | null) {
-    // make sure ancestors of the selection are expanded
+    // make sure ancestors of the selection are expanded; only rebuild the DOM when that changes something
+    let changed = false;
+    const expand = (p: string) => {
+      if (!this.expanded.has(p)) {
+        this.expanded.add(p);
+        changed = true;
+      }
+    };
     if (selectedPath) {
       const parts = selectedPath.split('/');
-      for (let i = 1; i < parts.length; i++) this.expanded.add(parts.slice(0, i).join('/'));
+      for (let i = 1; i < parts.length; i++) expand(parts.slice(0, i).join('/'));
     }
     const cur = currentPath.split('/');
-    for (let i = 1; i <= cur.length; i++) this.expanded.add(cur.slice(0, i).join('/'));
-    if (this.root) this.render(this.root);
-    for (const [p, row] of this.rows) {
-      row.classList.toggle('current', p === currentPath);
-      row.classList.toggle('selected', p === selectedPath);
-    }
+    for (let i = 1; i <= cur.length; i++) expand(cur.slice(0, i).join('/'));
+    this.curPath = currentPath;
+    this.selPath = selectedPath;
+    if (this.root && (changed || !this.container.firstChild)) this.render(this.root); // render() re-applies the marks
+    else this.applyMarks();
     const sel = selectedPath ? this.rows.get(selectedPath) : this.rows.get(currentPath);
     sel?.scrollIntoView({ block: 'nearest' });
+  }
+
+  private applyMarks() {
+    for (const p of this.marked) this.rows.get(p)?.classList.remove('current', 'selected');
+    this.marked = [];
+    const mark = (p: string | null, cls: string) => {
+      const row = p ? this.rows.get(p) : null;
+      if (!row) return;
+      row.classList.add(cls);
+      this.marked.push(p!);
+    };
+    mark(this.curPath, 'current');
+    mark(this.selPath, 'selected');
   }
 
   reset() {
     this.expanded.clear();
     this.rows.clear();
+    this.marked = [];
   }
 }

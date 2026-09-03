@@ -1,9 +1,5 @@
 import './style.css';
-import riscvSrc from './examples/riscv.v?raw';
-import gatesSrc from './examples/gates.v?raw';
 import rvSingle from './examples/rvsimple_singlecycle.sv?raw';
-import rvMulti from './examples/rvsimple_multicycle.sv?raw';
-import rvPipe from './examples/rvsimple_pipeline.sv?raw';
 import { loadDesign, buildHierarchy, resolvePath, type Design, type HierNode } from './model/design';
 import { buildGraph, allNodes, allEdges, type SGraph, type SNode } from './model/graph';
 import { sizeGraph } from './layout/metrics';
@@ -17,14 +13,29 @@ import type { Loc } from './parser/ast';
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
 
-const EXAMPLES: Record<string, string> = {
-  'rvsimple-singlecycle': rvSingle,
-  'rvsimple-multicycle': rvMulti,
-  'rvsimple-pipeline': rvPipe,
-  riscv: riscvSrc,
-  gates: gatesSrc,
+// the default example ships in the main bundle; the others are fetched on demand (keeps the phone boot small)
+const EXAMPLES: Record<string, () => Promise<string>> = {
+  'rvsimple-singlecycle': () => Promise.resolve(rvSingle),
+  'rvsimple-multicycle': () => import('./examples/rvsimple_multicycle.sv?raw').then((m) => m.default),
+  'rvsimple-pipeline': () => import('./examples/rvsimple_pipeline.sv?raw').then((m) => m.default),
+  riscv: () => import('./examples/riscv.v?raw').then((m) => m.default),
+  gates: () => import('./examples/gates.v?raw').then((m) => m.default),
 };
 const DEFAULT_EXAMPLE = 'rvsimple-singlecycle';
+let exampleLoading = 0;
+async function loadExample(key: string) {
+  const loader = EXAMPLES[key] ?? EXAMPLES[DEFAULT_EXAMPLE];
+  exampleLoading++;
+  try {
+    const src = await loader();
+    if (exampleSelect.value !== key) return; // the user picked another one meanwhile
+    loadSource(src);
+  } catch (err) {
+    statusEl.textContent = `Could not load example: ${(err as Error).message}`;
+  } finally {
+    exampleLoading--;
+  }
+}
 
 interface State {
   design: Design;
@@ -66,6 +77,7 @@ const styleEl = document.createElement('style');
 document.head.append(styleEl);
 function applyTheme() {
   document.documentElement.dataset.theme = state.dark ? 'dark' : 'light';
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', state.dark ? '#1b1f26' : '#ffffff');
   styleEl.textContent = schematicCss(state.dark ? DARK : LIGHT);
   editor?.setTheme(state.dark);
   try {
@@ -100,6 +112,9 @@ const diagEl = $('#diagnostics');
 const diagCount = $('#diag-count');
 const searchEl = $<HTMLInputElement>('#search');
 const searchResults = $('#search-results');
+const mbarEl = $('#mbar');
+const backdropEl = $('#backdrop');
+const infoCard = $('#infocard');
 
 let editor: SourceEditor | null = null;
 
@@ -121,6 +136,112 @@ function currentModule(): string | null {
 
 function currentPathString(): string {
   return [state.top, ...state.path].join('/');
+}
+
+// ---- mobile / desktop mode ---------------------------------------------------
+// Phones (and small touch screens) get the schematic-first layout: the schematic fills the screen,
+// hierarchy, source and settings live in bottom sheets. ?mobile=1|0 forces a mode (tests).
+const MOBILE_QUERY = '(max-width: 820px), ((pointer: coarse) and (max-width: 1100px))';
+const mobileMq = window.matchMedia(MOBILE_QUERY);
+let isMobile = false;
+function detectMobile(): boolean {
+  const forced = params.get('mobile');
+  if (forced === '1') return true;
+  if (forced === '0') return false;
+  return mobileMq.matches;
+}
+const SHEETS = ['tree-panel', 'editor-panel', 'settings-panel'] as const;
+type SheetId = (typeof SHEETS)[number];
+function openSheet(id: SheetId | null) {
+  for (const s of SHEETS) $(`#${s}`).classList.toggle('open', s === id);
+  backdropEl.hidden = !id;
+  $('#m-tree').classList.toggle('active', id === 'tree-panel');
+  $('#m-source').classList.toggle('active', id === 'editor-panel');
+  $('#m-settings').classList.toggle('active', id === 'settings-panel');
+  if (id) setSearchOpen(false);
+}
+function toggleSheet(id: SheetId) {
+  openSheet($(`#${id}`).classList.contains('open') ? null : id);
+}
+function setSearchOpen(on: boolean) {
+  document.documentElement.classList.toggle('search-open', on);
+  $('#m-search').classList.toggle('active', on);
+  if (on) {
+    searchEl.focus();
+    searchEl.select();
+    if (searchEl.value) runSearch(searchEl.value);
+  } else {
+    searchResults.hidden = true;
+    searchEl.blur();
+  }
+}
+function applyMode(mobile: boolean) {
+  isMobile = mobile;
+  document.documentElement.classList.toggle('mobile', mobile);
+  mbarEl.hidden = !mobile;
+  // the breadcrumbs live in the mobile bar or in the desktop toolbar
+  if (mobile) $('#m-title').append(crumbsEl);
+  else $('.toolbar').prepend(crumbsEl);
+  openSheet(null);
+  setSearchOpen(false);
+  hideContextMenu();
+  updateInfoCard();
+  // keep fitted content clear of the status line and the floating buttons
+  viewer.setFitInsets(mobile ? { top: 28, right: 62, bottom: 8, left: 4 } : { top: 0, right: 0, bottom: 0, left: 0 });
+  requestAnimationFrame(() => viewer.fit());
+}
+
+/** Selection details for touch users (replaces hover tooltips and the desktop context menu). */
+function updateInfoCard() {
+  if (!isMobile) {
+    infoCard.hidden = true;
+    return;
+  }
+  const titleEl = $('#ic-title');
+  const tipEl = $('#ic-tip');
+  const actions = $('#ic-actions');
+  actions.replaceChildren();
+  const add = (label: string, fn: () => void, primary = false) => {
+    const b = document.createElement('button');
+    b.className = 'btn' + (primary ? ' primary' : '');
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    actions.append(b);
+  };
+  const node = state.selectedNode;
+  if (node && state.graph) {
+    titleEl.textContent = node.kind === 'inst' ? `${node.title} : ${node.moduleName ?? ''}` : node.title;
+    const tip = node.tooltip ?? '';
+    // instance tooltips repeat "module name": only show them when they add parameters or notes
+    tipEl.textContent = tip === node.title || (node.kind === 'inst' && !/#\(|\(black box\)|\[/.test(tip)) ? '' : tip;
+    if (node.kind === 'inst' && node.instPath) {
+      const canDescend = !!node.moduleName && state.design.modules.has(node.moduleName);
+      if (canDescend) {
+        add('Descend', () => navigateTo([...state.path, ...node.instPath!.split('/')]), true);
+        add(state.expanded.has(node.instPath) ? 'Collapse' : 'Expand', () => toggleExpand(node));
+      }
+    }
+    add('Zoom', () => viewer.zoomToNode(node));
+    if (node.loc) add('Source', () => revealSource(node.loc!.start, node.loc!.end));
+    infoCard.hidden = false;
+    return;
+  }
+  if (state.hlNets.length && state.graph) {
+    const named = state.hlNets.filter((n) => !n.startsWith('~'));
+    const info = named.map((n) => state.graph!.nets.get(n)).find((i) => i);
+    titleEl.textContent = named.slice(0, 3).join(', ') + (named.length > 3 ? ` +${named.length - 3}` : '');
+    tipEl.textContent = info ? `${info.isPort ? 'port ' : 'net '}${info.width > 1 ? `[${info.msb}:${info.lsb}] ` : ''}${info.name} · ${info.drivers.length} driver(s), ${info.sinks.length} sink(s)` : '';
+    if (info?.loc) add('Source', () => revealSource(info.loc!.start, info.loc!.end));
+    infoCard.hidden = false;
+    return;
+  }
+  infoCard.hidden = true;
+}
+
+/** Jump the editor to a source range; on mobile also opens the source sheet. */
+function revealSource(start: number, end: number) {
+  editor?.reveal(start, end);
+  if (isMobile) openSheet('editor-panel');
 }
 
 // ---- rendering pipeline ----------------------------------------------------
@@ -183,6 +304,7 @@ function restoreSelection() {
   }
   viewer.setSelected(state.selectedNode?.id ?? null);
   viewer.setHighlight(state.hlNets);
+  updateInfoCard();
 }
 
 // ---- source handling -------------------------------------------------------
@@ -235,7 +357,7 @@ function renderDiagnostics() {
     const row = document.createElement('div');
     row.className = `d ${d.severity}`;
     row.innerHTML = `<span class="ln">${d.line}:</span>${escapeHtml(d.message)}`;
-    row.addEventListener('click', () => editor?.reveal(d.start, d.end));
+    row.addEventListener('click', () => revealSource(d.start, d.end));
     diagEl.append(row);
   }
 }
@@ -282,6 +404,8 @@ function renderCrumbs() {
     m.textContent = `(${mod})`;
     crumbsEl.append(m);
   }
+  ($('#m-up') as HTMLButtonElement).disabled = state.path.length === 0;
+  if (isMobile) crumbsEl.querySelector('.cur')?.scrollIntoView({ inline: 'end', block: 'nearest' });
 }
 
 // ---- selection sync ----------------------------------------------------------
@@ -292,6 +416,7 @@ function selectNode(node: SNode | null, fromEditor = false) {
   viewer.setHighlight([]);
   if (node?.loc && !fromEditor) editor?.reveal(node.loc.start, node.loc.end);
   tree.setState(currentPathString(), node?.instPath ? `${currentPathString()}/${node.instPath}` : null);
+  updateInfoCard();
 }
 
 function selectNets(nets: string[], fromEditor = false) {
@@ -319,6 +444,7 @@ function selectNets(nets: string[], fromEditor = false) {
     if (info?.loc) editor?.reveal(info.loc.start, info.loc.end);
   }
   tree.setState(currentPathString(), null);
+  updateInfoCard();
 }
 
 /** Editor cursor moved: find the element at the offset and highlight it. */
@@ -445,9 +571,9 @@ function showContextMenu(node: SNode | null, nets: string[] | null, x: number, y
     add(isExpanded ? 'Collapse instance' : 'Expand in place', canDescend ? () => toggleExpand(node) : null);
     add('Descend into instance', canDescend ? () => navigateTo([...state.path, ...node.instPath!.split('/')]) : null);
     add('Zoom to instance', () => viewer.zoomToNode(node));
-    add('Go to source', node.loc ? () => editor?.reveal(node.loc!.start, node.loc!.end) : null);
+    add('Go to source', node.loc ? () => revealSource(node.loc!.start, node.loc!.end) : null);
   } else if (node) {
-    add('Go to source', node.loc ? () => editor?.reveal(node.loc!.start, node.loc!.end) : null);
+    add('Go to source', node.loc ? () => revealSource(node.loc!.start, node.loc!.end) : null);
   } else if (nets) {
     add('Highlight net', () => selectNets(nets));
     add('Go to declaration', () => selectNets(nets));
@@ -459,16 +585,18 @@ function showContextMenu(node: SNode | null, nets: string[] | null, x: number, y
     });
     if (state.path.length) add('Go up', () => navigateTo(state.path.slice(0, -1), state.path[state.path.length - 1]));
   }
-  ctxEl.style.left = `${x}px`;
-  ctxEl.style.top = `${y}px`;
   ctxEl.hidden = false;
+  const vw = viewerEl.clientWidth;
+  const vh = viewerEl.clientHeight;
+  ctxEl.style.left = `${Math.max(0, Math.min(x, vw - ctxEl.offsetWidth - 4))}px`;
+  ctxEl.style.top = `${Math.max(0, Math.min(y, vh - ctxEl.offsetHeight - 4))}px`;
 }
 function hideContextMenu() {
   ctxEl.hidden = true;
 }
-window.addEventListener('mousedown', (ev) => {
+window.addEventListener('pointerdown', (ev) => {
   if (!ctxEl.contains(ev.target as Node)) hideContextMenu();
-  if (!searchResults.contains(ev.target as Node) && ev.target !== searchEl) searchResults.hidden = true;
+  if (!searchResults.contains(ev.target as Node) && ev.target !== searchEl && !(ev.target as Element).closest?.('#m-search')) searchResults.hidden = true;
 });
 
 function toggleExpand(node: SNode) {
@@ -484,6 +612,7 @@ function toggleExpand(node: SNode) {
 // ---- tree ------------------------------------------------------------------
 const tree = new HierTree($('#tree'), {
   onSelect: (h: HierNode) => {
+    if (isMobile) openSheet(null);
     const parts = h.path.split('/');
     if (parts.length === 1) {
       navigateTo([]);
@@ -504,6 +633,7 @@ const tree = new HierTree($('#tree'), {
   },
   onOpen: (h: HierNode) => {
     if (h.isBlackBox) return;
+    if (isMobile) openSheet(null);
     navigateTo(h.path.split('/').slice(1));
   },
 });
@@ -580,6 +710,7 @@ function renderSearch() {
     d.addEventListener('click', () => {
       it.run();
       searchResults.hidden = true;
+      if (isMobile) setSearchOpen(false);
     });
     searchResults.append(d);
   });
@@ -603,6 +734,7 @@ searchEl.addEventListener('keydown', (ev) => {
     if (it) {
       it.run();
       searchResults.hidden = true;
+      if (isMobile) setSearchOpen(false);
     }
   } else if (ev.key === 'Escape') {
     searchResults.hidden = true;
@@ -626,6 +758,39 @@ $('#export-btn').addEventListener('click', () => {
   const svg = exportSvg(viewer.getViewport(), state.bounds, state.dark ? DARK : LIGHT, mod);
   downloadText(`${mod}.svg`, svg);
 });
+// mobile bar, sheets, floating buttons
+$('#m-up').addEventListener('click', () => {
+  if (state.path.length) navigateTo(state.path.slice(0, -1), state.path[state.path.length - 1]);
+});
+$('#m-search').addEventListener('click', () => {
+  openSheet(null);
+  setSearchOpen(!document.documentElement.classList.contains('search-open'));
+});
+$('#m-tree').addEventListener('click', () => toggleSheet('tree-panel'));
+$('#m-source').addEventListener('click', () => toggleSheet('editor-panel'));
+$('#m-settings').addEventListener('click', () => toggleSheet('settings-panel'));
+for (const b of document.querySelectorAll<HTMLElement>('[data-close]')) b.addEventListener('click', () => openSheet(null));
+backdropEl.addEventListener('click', () => openSheet(null));
+$('#ic-close').addEventListener('click', () => selectNode(null));
+$('#m-fit').addEventListener('click', () => viewer.fit());
+$('#m-zoom-in').addEventListener('click', () => viewer.zoomBy(1.25));
+$('#m-zoom-out').addEventListener('click', () => viewer.zoomBy(0.8));
+mobileMq.addEventListener('change', () => applyMode(detectMobile()));
+// orientation change: the schematic keeps fitting the screen
+let fitTimer = 0;
+const refit = () => {
+  if (!isMobile) return;
+  if (fitTimer) clearTimeout(fitTimer);
+  fitTimer = window.setTimeout(() => viewer.fit(), 120);
+};
+screen.orientation?.addEventListener('change', refit);
+window.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && isMobile) {
+    openSheet(null);
+    setSearchOpen(false);
+  }
+});
+
 $('#theme-btn').addEventListener('click', () => {
   state.dark = !state.dark;
   applyTheme();
@@ -662,7 +827,7 @@ topSelect.addEventListener('change', () => {
   tree.render(buildHierarchy(state.design, state.top));
   void relayout(false);
 });
-exampleSelect.addEventListener('change', () => loadSource(EXAMPLES[exampleSelect.value] ?? ''));
+exampleSelect.addEventListener('change', () => void loadExample(exampleSelect.value));
 $('#open-btn').addEventListener('click', () => $<HTMLInputElement>('#file-input').click());
 $<HTMLInputElement>('#file-input').addEventListener('change', async (ev) => {
   const files = (ev.target as HTMLInputElement).files;
@@ -752,11 +917,12 @@ makeSplitter($('#split-right'), $('#editor-panel'), true);
 // ---- boot ------------------------------------------------------------------
 const initialExample = params.get('example') ?? DEFAULT_EXAMPLE;
 exampleSelect.value = EXAMPLES[initialExample] ? initialExample : DEFAULT_EXAMPLE;
-const initialSrc = EXAMPLES[exampleSelect.value];
+const initialSrc = await EXAMPLES[exampleSelect.value]();
 editor = new SourceEditor($('#editor'), initialSrc, state.dark);
 editor.onChange = (doc) => sourceChanged(doc);
 editor.onCursor = (off) => cursorMoved(off);
 applyTheme();
+applyMode(detectMobile());
 if (params.get('editor') === '0') $('#editor-btn').click();
 sourceChanged(initialSrc, true, true);
 if (params.get('path')) {
@@ -785,5 +951,8 @@ if (params.get('types') === '0') {
     state.dark = dark;
     applyTheme();
   },
-  isBusy: () => layoutRunning || parseTimer !== null,
+  isBusy: () => layoutRunning || parseTimer !== null || exampleLoading > 0,
+  isMobile: () => isMobile,
+  openSheet,
+  setGestureMode: (m: 'auto' | 'direct' | 'composited') => viewer.setGestureMode(m),
 };
